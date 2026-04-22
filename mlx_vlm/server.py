@@ -398,7 +398,8 @@ class ResponseGenerator:
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         global generation_stream
-        generation_stream = mx.new_stream(mx.default_device())
+        generation_stream = mx.new_thread_local_stream(mx.default_device())
+        mx.set_default_stream(generation_stream)
         generate_module.generation_stream = generation_stream
 
         if self.draft_model is not None:
