@@ -1254,6 +1254,7 @@ def generate(
                 prompt_tps=0.0,
                 generation_tps=0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
+                cached_prompt_tokens=0,
             )
         print(
             f"Prompt: {last_response.prompt_tokens} tokens, "
@@ -1275,6 +1276,7 @@ def generate(
         prompt_tps=last_response.prompt_tps,
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
+        cached_prompt_tokens=last_response.cached_prompt_tokens,
     )
 
 
