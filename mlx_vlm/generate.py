@@ -1,6 +1,7 @@
 import argparse
 import codecs
 import contextlib
+import copy
 import functools
 import json
 import time
@@ -18,7 +19,12 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
+from .turboquant import (
+    BatchTurboQuantKVCache,
+    TurboQuantKVCache,
+    _slice_state as _slice_turbo_state,
+    turboquant_enabled,
+)
 from .utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
@@ -403,6 +409,63 @@ class PromptCacheState:
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+
+
+def _slice_cache_tokens(value, length: int):
+    """Slice KV cache tensor/state leaves to ``length`` tokens."""
+    if value is None:
+        return None
+    if isinstance(value, mx.array):
+        if value.ndim >= 3:
+            return value[..., :length, :]
+        return value
+    if isinstance(value, tuple):
+        try:
+            return _slice_turbo_state(value, length)
+        except TypeError:
+            return tuple(_slice_cache_tokens(part, length) for part in value)
+    return _slice_turbo_state(value, length)
+
+
+def snapshot_prompt_cache(prompt_cache: list, batch_index: int = 0) -> list:
+    """Copy one row from a batched prompt cache for later prompt reuse."""
+    index = mx.array([batch_index], dtype=mx.int32)
+    snapshot = []
+    for entry in prompt_cache:
+        copied = copy.copy(entry)
+        copied.filter(index)
+        snapshot.append(copied)
+    mx.eval([entry.state for entry in snapshot])
+    return snapshot
+
+
+def trim_prompt_cache(prompt_cache: list, length: int) -> list:
+    """Return a shallow copy of a prompt cache truncated to ``length`` tokens."""
+    trimmed = []
+    for entry in prompt_cache:
+        copied = copy.copy(entry)
+        state = copied.state
+        if isinstance(state, tuple) and len(state) == 4:
+            keys, values, _offset, _left_padding = state
+            copied.state = (
+                _slice_cache_tokens(keys, length),
+                _slice_cache_tokens(values, length),
+                mx.array([length], dtype=mx.int32),
+                mx.array([0], dtype=mx.int32),
+            )
+        elif isinstance(state, tuple) and len(state) == 2:
+            keys, values = state
+            copied.state = (
+                _slice_cache_tokens(keys, length),
+                _slice_cache_tokens(values, length),
+            )
+            if hasattr(copied, "offset"):
+                copied.offset = length
+        else:
+            raise TypeError(f"Unsupported prompt cache state: {type(state)!r}")
+        trimmed.append(copied)
+    mx.eval([entry.state for entry in trimmed])
+    return trimmed
 
 
 def _speculative_walk(
@@ -1463,6 +1526,7 @@ class GenerationBatch:
         token_logprob: float
         finish_reason: Optional[str]
         top_logprobs: Optional[List[Tuple[int, float]]] = None
+        prompt_cache: Optional[List[Any]] = None
 
     def __init__(
         self,
@@ -1660,6 +1724,9 @@ class GenerationBatch:
 
             if finish_reason is None:
                 keep.append(i)
+                prompt_cache = None
+            else:
+                prompt_cache = snapshot_prompt_cache(self.prompt_cache, i)
 
             top_lp = None
             if top_idx_list is not None:
@@ -1672,6 +1739,7 @@ class GenerationBatch:
                     token_logprob=lp_list[i] if lp_list is not None else 0.0,
                     finish_reason=finish_reason,
                     top_logprobs=top_lp,
+                    prompt_cache=prompt_cache,
                 )
             )
 
@@ -1727,6 +1795,7 @@ class PromptProcessingBatch:
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+        prompt_cache: Optional[List[Any]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1742,7 +1811,7 @@ class PromptProcessingBatch:
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
-        self.prompt_cache = _make_cache(
+        self.prompt_cache = prompt_cache or _make_cache(
             model,
             left_padding,
             kv_bits=kv_bits,
@@ -1916,6 +1985,7 @@ class BatchGenerator:
         prompts,
         max_tokens: Union[List[int], int, None] = None,
         prompt_kwargs: Optional[List[dict]] = None,
+        prompt_caches: Optional[List[Optional[list]]] = None,
     ):
         uids = []
 
@@ -1924,9 +1994,11 @@ class BatchGenerator:
 
         if prompt_kwargs is None:
             prompt_kwargs = [{}] * len(prompts)
+        if prompt_caches is None:
+            prompt_caches = [None] * len(prompts)
 
-        for p, m, kw in zip(prompts, max_tokens, prompt_kwargs):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw))
+        for p, m, kw, pc in zip(prompts, max_tokens, prompt_kwargs, prompt_caches):
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, pc))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -1939,7 +2011,7 @@ class BatchGenerator:
         """Remove a sequence from the batch by uid."""
         with mx.stream(generation_stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -2034,7 +2106,16 @@ class BatchGenerator:
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
         if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
-            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
+            first_has_cache = self._unprocessed_sequences[0][4] is not None
+            if first_has_cache:
+                n = 1
+            else:
+                uncached_count = 0
+                for sequence in self._unprocessed_sequences:
+                    if sequence[4] is not None:
+                        break
+                    uncached_count += 1
+                n = min(self.prefill_batch_size, uncached_count)
             sequences = self._unprocessed_sequences[:n]
             self._unprocessed_sequences = self._unprocessed_sequences[n:]
 
@@ -2042,6 +2123,7 @@ class BatchGenerator:
             input_ids = [s[1] for s in sequences]
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
+            prompt_caches = [s[4] for s in sequences]
 
             inputs_embeds = None
             merged_kwargs = {}
@@ -2072,6 +2154,7 @@ class BatchGenerator:
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
+                prompt_cache=prompt_caches[0] if len(prompt_caches) == 1 else None,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

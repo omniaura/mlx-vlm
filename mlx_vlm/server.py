@@ -46,6 +46,7 @@ from .generate import (
     generation_stream,
     normalize_resize_shape,
     stream_generate,
+    trim_prompt_cache,
 )
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
@@ -169,6 +170,7 @@ class GenerationContext:
 
     uid: int
     prompt_tokens: int
+    cached_prompt_tokens: int = 0
 
 
 @dataclass
@@ -181,6 +183,7 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+    cached_prompt_tokens: int = 0
 
 
 class ResponseGenerator:
@@ -246,6 +249,7 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        prompt_cache_state: Optional[PromptCacheState] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
         args = args or GenerationArguments()
         rqueue: Queue = Queue()
@@ -259,7 +263,9 @@ class ResponseGenerator:
             else len(raw_inputs["input_ids"])
         )
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+        self.requests.put(
+            (rqueue, raw_inputs, prompt_tokens, args, images, prompt_cache_state)
+        )
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -353,6 +359,40 @@ class ResponseGenerator:
         gen_kwargs = {**data_kwargs, **embed.to_dict()}
         return input_ids, gen_kwargs
 
+    def _prepare_prompt_cache_reuse(
+        self,
+        input_ids: mx.array,
+        gen_kwargs: dict,
+        prompt_cache_state: Optional[PromptCacheState],
+    ) -> Tuple[List[int], dict, Optional[list], int]:
+        """Trim a prompt to its uncached suffix and return a reusable cache."""
+        full_ids = input_ids.squeeze(0).tolist()
+        if prompt_cache_state is None or prompt_cache_state.cache is None:
+            return full_ids, gen_kwargs, None, 0
+
+        prefix_len = prompt_cache_state.find_prefix_length(full_ids)
+        reusable_prefix_len = min(prefix_len, max(len(full_ids) - 1, 0))
+        if reusable_prefix_len <= 0:
+            return full_ids, gen_kwargs, None, 0
+
+        trimmed_kwargs = dict(gen_kwargs)
+        inputs_embeds = trimmed_kwargs.get("inputs_embeds")
+        if inputs_embeds is None or inputs_embeds.shape[1] <= reusable_prefix_len:
+            return full_ids, gen_kwargs, None, 0
+
+        trimmed_kwargs["inputs_embeds"] = inputs_embeds[:, reusable_prefix_len:, :]
+        for key in ("attention_mask", "position_ids"):
+            value = trimmed_kwargs.get(key)
+            if isinstance(value, mx.array) and value.ndim >= 2:
+                trimmed_kwargs[key] = value[:, reusable_prefix_len:]
+
+        return (
+            full_ids[reusable_prefix_len:],
+            trimmed_kwargs,
+            trim_prompt_cache(prompt_cache_state.cache, reusable_prefix_len),
+            reusable_prefix_len,
+        )
+
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         if self.draft_model is not None:
@@ -409,7 +449,14 @@ class ResponseGenerator:
                             except Exception:
                                 pass
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                for (
+                    rqueue,
+                    raw_inputs,
+                    prompt_tokens,
+                    args,
+                    images,
+                    prompt_cache_state,
+                ) in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -426,6 +473,14 @@ class ResponseGenerator:
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    (
+                        insert_ids,
+                        gen_kwargs,
+                        reusable_prompt_cache,
+                        cached_prompt_tokens,
+                    ) = self._prepare_prompt_cache_reuse(
+                        input_ids, gen_kwargs, prompt_cache_state
+                    )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
                     # Image/embed requests can't share a prefill batch with
@@ -435,19 +490,29 @@ class ResponseGenerator:
 
                     try:
                         (uid,) = batch_gen.insert(
-                            [input_ids.squeeze(0).tolist()],
+                            [insert_ids],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
+                            prompt_caches=[reusable_prompt_cache],
                         )
                     except Exception as e:
                         rqueue.put(e)
                         continue
 
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    rqueue.put(
+                        GenerationContext(
+                            uid=uid,
+                            prompt_tokens=prompt_tokens,
+                            cached_prompt_tokens=cached_prompt_tokens,
+                        )
+                    )
                     active[uid] = {
                         "rqueue": rqueue,
                         "tokens": [],
                         "prev_text": "",
+                        "input_ids": input_ids.squeeze(0).tolist(),
+                        "prompt_cache_state": prompt_cache_state,
+                        "cached_prompt_tokens": cached_prompt_tokens,
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -514,7 +579,7 @@ class ResponseGenerator:
                 max_tokens_map = {}
                 all_input_ids = []
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                for rqueue, raw_inputs, prompt_tokens, args, images, _ in pending:
                     input_ids, _ = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -675,6 +740,7 @@ class ResponseGenerator:
                 info["prev_text"] = curr
 
             lp = r.token_logprob
+            cached_prompt_tokens = info.get("cached_prompt_tokens", 0)
 
             rqueue.put(
                 StreamingToken(
@@ -684,10 +750,17 @@ class ResponseGenerator:
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     top_logprobs=getattr(r, "top_logprobs", None),
+                    cached_prompt_tokens=cached_prompt_tokens,
                 )
             )
 
             if r.finish_reason is not None:
+                prompt_cache_state = info.get("prompt_cache_state")
+                if prompt_cache_state is not None and getattr(r, "prompt_cache", None):
+                    prompt_cache_state.update(
+                        info.get("input_ids", []) + info["tokens"],
+                        r.prompt_cache,
+                    )
                 rqueue.put(None)
                 del active[r.uid]
 
@@ -1047,9 +1120,9 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         draft_model = load_drafter(draft_model_path, kind=draft_kind)
         print("Drafter ready — speculative decoding enabled.")
 
-    # Create ResponseGenerator for continuous batching unless persistent prompt
-    # cache mode is enabled. PromptCacheState is used by stream_generate/generate,
-    # not BatchGenerator, so the two modes are intentionally exclusive.
+    # Create ResponseGenerator for continuous batching.  When persistent prompt
+    # cache mode is enabled, ResponseGenerator reuses per-request PromptCacheState
+    # inside its GPU thread before inserting work into the continuous batch.
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
@@ -1060,23 +1133,19 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     kv_quant_scheme = get_kv_quant_scheme()
 
     if prompt_cache_enabled():
-        print(
-            "Persistent PromptCacheState mode enabled; continuous batching disabled."
-        )
-        response_generator = None
-    else:
-        response_generator = ResponseGenerator(
-            model=model,
-            processor=processor,
-            stop_tokens=stop_tokens,
-            vision_cache=vision_cache,
-            draft_model=draft_model,
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            kv_quant_scheme=kv_quant_scheme,
-            quantized_kv_start=quantized_kv_start,
-            top_logprobs_k=get_top_logprobs_k(),
-        )
+        print("Persistent PromptCacheState mode enabled with continuous batching.")
+    response_generator = ResponseGenerator(
+        model=model,
+        processor=processor,
+        stop_tokens=stop_tokens,
+        vision_cache=vision_cache,
+        draft_model=draft_model,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        kv_quant_scheme=kv_quant_scheme,
+        quantized_kv_start=quantized_kv_start,
+        top_logprobs_k=get_top_logprobs_k(),
+    )
 
     model_cache = {
         "cache_key": cache_key,
@@ -1768,6 +1837,7 @@ async def responses_endpoint(request: Request):
                             prompt=formatted_prompt,
                             images=images if images else None,
                             args=gen_args,
+                            prompt_cache_state=prompt_cache_state,
                         )
 
                         output_tokens = 0
@@ -1889,6 +1959,7 @@ async def responses_endpoint(request: Request):
                         prompt=formatted_prompt,
                         images=images if images else None,
                         args=gen_args,
+                        prompt_cache_state=prompt_cache_state,
                     )
                     prompt_tokens = ctx.prompt_tokens
                     for token in token_iter:
@@ -2129,6 +2200,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             images if images else None,
                             audio if audio else None,
                             gen_args,
+                            prompt_cache_state,
                         )
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -2229,6 +2301,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                                         "completion_tokens": output_tokens,
                                         "total_tokens": ctx.prompt_tokens
                                         + output_tokens,
+                                        "prompt_tokens_details": {
+                                            "cached_tokens": ctx.cached_prompt_tokens,
+                                        },
                                     },
                                     choices=choices,
                                 )
@@ -2353,6 +2428,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 prompt_tokens = 0
                 output_tokens = 0
                 peak_memory = 0.0
+                cached_prompt_tokens = 0
 
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
@@ -2364,13 +2440,16 @@ async def chat_completions_endpoint(request: ChatRequest):
                         text = ""
                         pt = gt = 0
                         pm = 0.0
+                        cached = 0
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
                             audio=audio if audio else None,
                             args=gen_args,
+                            prompt_cache_state=prompt_cache_state,
                         )
                         pt = ctx.prompt_tokens
+                        cached = ctx.cached_prompt_tokens
                         for token in token_iter:
                             text += token.text
                             gt += 1
@@ -2385,9 +2464,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, pm
+                        return text, pt, gt, pm, cached
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                        cached_prompt_tokens,
+                    ) = (
                         await asyncio.to_thread(_blocking_generate)
                     )
                 else:
@@ -2425,7 +2510,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                     prompt_tokens_details=PromptTokensDetails(
-                        cached_tokens=gen_result.cached_prompt_tokens,
+                        cached_tokens=(
+                            gen_result.cached_prompt_tokens
+                            if response_generator is None
+                            else cached_prompt_tokens
+                        ),
                     ),
                     peak_memory=peak_memory,
                 )
