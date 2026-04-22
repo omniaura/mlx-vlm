@@ -8,6 +8,7 @@ import re
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,7 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
+    PromptCacheState,
     _dflash_rounds_batch,
     _make_cache,
     generate,
@@ -100,6 +102,14 @@ def get_top_logprobs_k():
     """
     k = int(os.environ.get("TOP_LOGPROBS_K", 0))
     return max(0, min(k, 20))
+
+
+def prompt_cache_enabled():
+    return os.environ.get("MLX_VLM_PROMPT_CACHE", "false").lower() == "true"
+
+
+def get_prompt_cache_size():
+    return max(1, int(os.environ.get("MLX_VLM_PROMPT_CACHE_SIZE", "8")))
 
 
 # =============================================================================
@@ -858,6 +868,54 @@ response_generator: Optional[ResponseGenerator] = None
 
 # Loading/unloading utilities
 model_cache = {}
+prompt_cache_states: "OrderedDict[Tuple[str, Optional[str], str], PromptCacheState]" = (
+    OrderedDict()
+)
+prompt_cache_lock = Lock()
+prompt_generation_lock = Lock()
+
+
+def _request_prompt_cache_id(request, default: str = "default") -> str:
+    for attr in ("user", "session_id", "conversation_id"):
+        value = getattr(request, attr, None)
+        if value:
+            return str(value)
+
+    extra = getattr(request, "__pydantic_extra__", None) or {}
+    for key in ("user", "session_id", "conversation_id"):
+        value = extra.get(key)
+        if value:
+            return str(value)
+
+    return default
+
+
+def get_prompt_cache_state(
+    model_path: str,
+    adapter_path: Optional[str],
+    cache_id: str,
+) -> Optional[PromptCacheState]:
+    if not prompt_cache_enabled():
+        return None
+
+    cache_key = (model_path, adapter_path, cache_id)
+    with prompt_cache_lock:
+        state = prompt_cache_states.get(cache_key)
+        if state is None:
+            state = PromptCacheState()
+            prompt_cache_states[cache_key] = state
+        else:
+            prompt_cache_states.move_to_end(cache_key)
+
+        while len(prompt_cache_states) > get_prompt_cache_size():
+            prompt_cache_states.popitem(last=False)
+
+        return state
+
+
+def clear_prompt_cache_states():
+    with prompt_cache_lock:
+        prompt_cache_states.clear()
 
 
 @asynccontextmanager
@@ -972,7 +1030,9 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         draft_model = load_drafter(draft_model_path, kind=draft_kind)
         print("Drafter ready — speculative decoding enabled.")
 
-    # Create ResponseGenerator for continuous batching
+    # Create ResponseGenerator for continuous batching unless persistent prompt
+    # cache mode is enabled. PromptCacheState is used by stream_generate/generate,
+    # not BatchGenerator, so the two modes are intentionally exclusive.
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
@@ -982,18 +1042,24 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
 
-    response_generator = ResponseGenerator(
-        model=model,
-        processor=processor,
-        stop_tokens=stop_tokens,
-        vision_cache=vision_cache,
-        draft_model=draft_model,
-        kv_bits=kv_bits,
-        kv_group_size=kv_group_size,
-        kv_quant_scheme=kv_quant_scheme,
-        quantized_kv_start=quantized_kv_start,
-        top_logprobs_k=get_top_logprobs_k(),
-    )
+    if prompt_cache_enabled():
+        print(
+            "Persistent PromptCacheState mode enabled; continuous batching disabled."
+        )
+        response_generator = None
+    else:
+        response_generator = ResponseGenerator(
+            model=model,
+            processor=processor,
+            stop_tokens=stop_tokens,
+            vision_cache=vision_cache,
+            draft_model=draft_model,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+            top_logprobs_k=get_top_logprobs_k(),
+        )
 
     model_cache = {
         "cache_key": cache_key,
@@ -1027,6 +1093,7 @@ def unload_model_sync():
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
+    clear_prompt_cache_states()
     model_cache = {}
     # Force garbage collection
     gc.collect()
@@ -1608,6 +1675,11 @@ async def responses_endpoint(request: Request):
             num_images=len(images),
             **gen_args.to_template_kwargs(),
         )
+        prompt_cache_state = get_prompt_cache_state(
+            openai_request.model,
+            model_cache.get("adapter_path"),
+            _request_prompt_cache_id(openai_request),
+        )
 
         logger.debug(
             "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
@@ -1698,31 +1770,31 @@ async def responses_endpoint(request: Request):
                                 break
                     else:
                         # Fallback to stream_generate
-                        token_iterator = stream_generate(
-                            model=model,
-                            processor=processor,
-                            prompt=formatted_prompt,
-                            image=images,
-                            temperature=openai_request.temperature,
-                            max_tokens=openai_request.max_output_tokens,
-                            top_p=openai_request.top_p,
-                            vision_cache=model_cache.get("vision_cache"),
-                            **kwargs,
-                        )
+                        with prompt_generation_lock:
+                            token_iterator = stream_generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                vision_cache=model_cache.get("vision_cache"),
+                                prompt_cache_state=prompt_cache_state,
+                                **gen_args.to_generate_kwargs(),
+                                **kwargs,
+                            )
 
-                        for chunk in token_iterator:
-                            if chunk is None or not hasattr(chunk, "text"):
-                                continue
+                            for chunk in token_iterator:
+                                if chunk is None or not hasattr(chunk, "text"):
+                                    continue
 
-                            delta = chunk.text
-                            full_text += delta
-                            usage_stats = {
-                                "input_tokens": chunk.prompt_tokens,
-                                "output_tokens": chunk.generation_tokens,
-                            }
+                                delta = chunk.text
+                                full_text += delta
+                                usage_stats = {
+                                    "input_tokens": chunk.prompt_tokens,
+                                    "output_tokens": chunk.generation_tokens,
+                                }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
                     # Split thinking from content for final events
                     _, clean_text = _split_thinking(full_text)
@@ -1811,16 +1883,18 @@ async def responses_endpoint(request: Request):
                     except Exception:
                         pass
                 else:
-                    result = generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        verbose=logger.isEnabledFor(logging.DEBUG),
-                        vision_cache=model_cache.get("vision_cache"),
-                        **gen_args.to_generate_kwargs(),
-                        **kwargs,
-                    )
+                    with prompt_generation_lock:
+                        result = generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            verbose=logger.isEnabledFor(logging.DEBUG),
+                            vision_cache=model_cache.get("vision_cache"),
+                            prompt_cache_state=prompt_cache_state,
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
                     full_text = result.text
                     prompt_tokens = result.prompt_tokens
                     output_tokens = result.generation_tokens
@@ -2002,6 +2076,11 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools=tools,
             **gen_args.to_template_kwargs(),
         )
+        prompt_cache_state = get_prompt_cache_state(
+            request.model,
+            model_cache.get("adapter_path"),
+            _request_prompt_cache_id(request),
+        )
 
         logger.debug(
             "chat/completions request: model=%s images=%d audio=%d "
@@ -2162,49 +2241,52 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
                         # Fallback to stream_generate
-                        token_iterator = stream_generate(
-                            model=model,
-                            processor=processor,
-                            prompt=formatted_prompt,
-                            image=images,
-                            audio=audio,
-                            temperature=request.temperature,
-                            max_tokens=request.max_tokens,
-                            top_p=request.top_p,
-                            vision_cache=model_cache.get("vision_cache"),
-                            **kwargs,
-                        )
-
-                        request_id = f"chatcmpl-{uuid.uuid4()}"
-                        output_text = ""
-                        for chunk in token_iterator:
-                            if chunk is None or not hasattr(chunk, "text"):
-                                continue
-
-                            output_text += chunk.text
-
-                            choices = [
-                                ChatStreamChoice(
-                                    delta=ChatMessage(
-                                        role="assistant", content=chunk.text
-                                    )
-                                )
-                            ]
-                            chunk_data = ChatStreamChunk(
-                                id=request_id,
-                                created=int(time.time()),
-                                model=request.model,
-                                usage={
-                                    "prompt_tokens": chunk.prompt_tokens,
-                                    "completion_tokens": chunk.generation_tokens,
-                                    "total_tokens": chunk.prompt_tokens
-                                    + chunk.generation_tokens,
-                                },
-                                choices=choices,
+                        with prompt_generation_lock:
+                            token_iterator = stream_generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                audio=audio,
+                                vision_cache=model_cache.get("vision_cache"),
+                                prompt_cache_state=prompt_cache_state,
+                                **gen_args.to_generate_kwargs(),
+                                **kwargs,
                             )
 
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            request_id = f"chatcmpl-{uuid.uuid4()}"
+                            output_text = ""
+                            for chunk in token_iterator:
+                                if chunk is None or not hasattr(chunk, "text"):
+                                    continue
+
+                                output_text += chunk.text
+
+                                choices = [
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant", content=chunk.text
+                                        )
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": chunk.prompt_tokens,
+                                        "completion_tokens": chunk.generation_tokens,
+                                        "total_tokens": chunk.prompt_tokens
+                                        + chunk.generation_tokens,
+                                        "prompt_tokens_details": {
+                                            "cached_tokens": chunk.cached_prompt_tokens,
+                                        },
+                                    },
+                                    choices=choices,
+                                )
+
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
                     # Signal stream end
                     yield "data: [DONE]\n\n"
@@ -2288,17 +2370,19 @@ async def chat_completions_endpoint(request: ChatRequest):
                         await asyncio.to_thread(_blocking_generate)
                     )
                 else:
-                    gen_result = generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        audio=audio,
-                        verbose=logger.isEnabledFor(logging.DEBUG),
-                        vision_cache=model_cache.get("vision_cache"),
-                        **gen_args.to_generate_kwargs(),
-                        **kwargs,
-                    )
+                    with prompt_generation_lock:
+                        gen_result = generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            audio=audio,
+                            verbose=logger.isEnabledFor(logging.DEBUG),
+                            vision_cache=model_cache.get("vision_cache"),
+                            prompt_cache_state=prompt_cache_state,
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
                     full_text = gen_result.text
                     prompt_tokens = gen_result.prompt_tokens
                     output_tokens = gen_result.generation_tokens
@@ -2318,6 +2402,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=gen_result.cached_prompt_tokens,
+                    ),
                     peak_memory=peak_memory,
                 )
 
@@ -2590,6 +2677,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--prompt-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Persist PromptCacheState across HTTP requests for common-prefix "
+            "reuse. This disables continuous batching."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=int,
+        default=8,
+        help="Maximum number of per-model prompt cache states to keep.",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -2626,6 +2728,9 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+    if args.prompt_cache:
+        os.environ["MLX_VLM_PROMPT_CACHE"] = "true"
+    os.environ["MLX_VLM_PROMPT_CACHE_SIZE"] = str(args.prompt_cache_size)
 
     # Configure logging
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
