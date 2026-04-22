@@ -2009,30 +2009,29 @@ class BatchGenerator:
 
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
-        with mx.stream(generation_stream):
-            # Waiting in the queue.
-            for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
-                if seq_uid == uid:
-                    self._unprocessed_sequences.pop(i)
-                    return True
-
-            # Being prefilled
-            if self._prompt_batch is not None and uid in self._prompt_batch.uids:
-                if len(self._prompt_batch.uids) == 1:
-                    self._prompt_batch.uids = []
-                    self._prompt_batch.prompt_cache = []
-                    self._prompt_batch = None
-                    mx.clear_cache()
-                    return True
-
-            # Already decoding.
-            if uid in self._generation_batch.uids:
-                idx = self._generation_batch.uids.index(uid)
-                keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
-                self._generation_batch.filter(keep)
+        # Waiting in the queue.
+        for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
+            if seq_uid == uid:
+                self._unprocessed_sequences.pop(i)
                 return True
 
-            return False
+        # Being prefilled
+        if self._prompt_batch is not None and uid in self._prompt_batch.uids:
+            if len(self._prompt_batch.uids) == 1:
+                self._prompt_batch.uids = []
+                self._prompt_batch.prompt_cache = []
+                self._prompt_batch = None
+                mx.clear_cache()
+                return True
+
+        # Already decoding.
+        if uid in self._generation_batch.uids:
+            idx = self._generation_batch.uids.index(uid)
+            keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
+            self._generation_batch.filter(keep)
+            return True
+
+        return False
 
     @property
     def unprocessed_prompts(self):
@@ -2180,8 +2179,7 @@ class BatchGenerator:
         return prompt_responses, generation_responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
-            return self._next(**kwargs)
+        return self._next(**kwargs)
 
 
 def batch_generate(
