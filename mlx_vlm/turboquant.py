@@ -3820,6 +3820,14 @@ def _concat_state(lhs, rhs):
     raise TypeError(f"Unsupported TurboQuant state type: {type(lhs)!r}")
 
 
+def _safe_eval(*arrays):
+    try:
+        mx.eval(*arrays)
+    except RuntimeError as exc:
+        if "There is no Stream" not in str(exc):
+            raise
+
+
 def _slice_state(state, end: int):
     if state is None:
         return None
@@ -5051,7 +5059,7 @@ class TurboQuantKVCache(_BaseCache):
         self._cached_state = None
         self._cached_state_offset = -1
         if n_new > 1 or (self.offset % 50 == 0):
-            mx.eval(self.keys, self.values)
+            _safe_eval(self.keys, self.values)
         ks, vs = self.state
         return (
             _QuantizedStateProxy(ks, self.offset, n_heads),
@@ -5188,10 +5196,10 @@ class TurboQuantKVCache(_BaseCache):
                 )
                 normalizer = normalizer * prev_scale + chunk_denom * chunk_scale
                 max_score = new_max
-                mx.eval(output, normalizer, max_score)
+                _safe_eval(output, normalizer, max_score)
 
             outputs.append(output / mx.maximum(normalizer[..., None], _EPS))
-            mx.eval(outputs[-1])
+            _safe_eval(outputs[-1])
 
         output = mx.concatenate(outputs, axis=3)
         output = output.reshape(B, n_q_heads, L, value_dim)
@@ -5980,7 +5988,7 @@ class TurboQuantKVCache(_BaseCache):
             )
             normalizer = normalizer * prev_scale + chunk_denom * chunk_scale
             max_score = new_max
-            mx.eval(output, normalizer, max_score)
+            _safe_eval(output, normalizer, max_score)
 
         output = output / mx.maximum(normalizer[..., None], _EPS)
         output = output.reshape(B, n_q_heads, L, value_dim)
@@ -6120,7 +6128,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         self._idx = new_end
 
         if keys.shape[2] > 1 or (self._idx % 50 == 0):
-            mx.eval(self.keys, self.values)
+            _safe_eval(self.keys, self.values)
 
         ks = _slice_state(self.keys, self._idx)
         vs = _slice_state(self.values, self._idx)
