@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gc
+import importlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from threading import Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger("mlx_vlm.server")
+generate_module = importlib.import_module("mlx_vlm.generate")
 
 import mlx.core as mx
 import uvicorn
@@ -801,6 +803,11 @@ def _server_generate_kwargs(model_path: str) -> dict:
     if max_kv_size is not None:
         kw["max_kv_size"] = max_kv_size
     return kw
+
+
+def _prepare_thread_generation_stream():
+    """Create a generation stream owned by the current worker thread."""
+    generate_module.generation_stream = mx.new_stream(mx.default_device())
 
 
 def _count_thinking_tag_tokens(text: str) -> int:
@@ -1793,6 +1800,7 @@ async def responses_endpoint(request: Request):
                         def _run_stream_generate():
                             local_iterator = None
                             try:
+                                _prepare_thread_generation_stream()
                                 with prompt_generation_lock:
                                     local_iterator = stream_generate(
                                         model=model,
@@ -1927,6 +1935,7 @@ async def responses_endpoint(request: Request):
                         pass
                 else:
                     def _blocking_generate_with_prompt_cache():
+                        _prepare_thread_generation_stream()
                         with prompt_generation_lock:
                             return generate(
                                 model=model,
@@ -2296,6 +2305,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         def _run_stream_generate():
                             local_iterator = None
                             try:
+                                _prepare_thread_generation_stream()
                                 with prompt_generation_lock:
                                     local_iterator = stream_generate(
                                         model=model,
@@ -2447,6 +2457,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
                 else:
                     def _blocking_generate_with_prompt_cache():
+                        _prepare_thread_generation_stream()
                         with prompt_generation_lock:
                             return generate(
                                 model=model,
