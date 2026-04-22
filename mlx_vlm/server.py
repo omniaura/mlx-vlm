@@ -2118,6 +2118,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 global response_generator
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                output_tokens = 0
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None:
@@ -2130,7 +2131,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                             gen_args,
                         )
 
-                        output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         # Track thinking state for reasoning/content split
                         in_thinking = False
@@ -2281,6 +2281,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     continue
 
                                 output_text += chunk.text
+                                output_tokens = chunk.generation_tokens
 
                                 choices = [
                                     ChatStreamChoice(
