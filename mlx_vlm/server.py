@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gc
+import importlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from threading import Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger("mlx_vlm.server")
+generate_module = importlib.import_module("mlx_vlm.generate")
 
 import mlx.core as mx
 import uvicorn
@@ -395,6 +397,10 @@ class ResponseGenerator:
 
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        global generation_stream
+        generation_stream = mx.new_stream(mx.default_device())
+        generate_module.generation_stream = generation_stream
+
         if self.draft_model is not None:
             self._run_speculative()
             return
@@ -527,6 +533,12 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in generation thread: {e}")
                 traceback.print_exc()
+                for uid, info in list(active.items()):
+                    try:
+                        info["rqueue"].put(e)
+                    except Exception:
+                        pass
+                    active.pop(uid, None)
 
     def _run_speculative(self):
         """GPU thread loop with DFlash speculative decoding.
