@@ -424,6 +424,8 @@ def _slice_cache_tokens(value, length: int):
             return _slice_turbo_state(value, length)
         except TypeError:
             return tuple(_slice_cache_tokens(part, length) for part in value)
+    if isinstance(value, list):
+        return [_slice_cache_tokens(part, length) for part in value]
     return _slice_turbo_state(value, length)
 
 
@@ -432,7 +434,7 @@ def snapshot_prompt_cache(prompt_cache: list, batch_index: int = 0) -> list:
     index = mx.array([batch_index], dtype=mx.int32)
     snapshot = []
     for entry in prompt_cache:
-        copied = copy.copy(entry)
+        copied = copy.deepcopy(entry)
         copied.filter(index)
         snapshot.append(copied)
     mx.eval([entry.state for entry in snapshot])
@@ -443,7 +445,7 @@ def trim_prompt_cache(prompt_cache: list, length: int) -> list:
     """Return a shallow copy of a prompt cache truncated to ``length`` tokens."""
     trimmed = []
     for entry in prompt_cache:
-        copied = copy.copy(entry)
+        copied = copy.deepcopy(entry)
         state = copied.state
         if isinstance(state, tuple) and len(state) == 4:
             keys, values, _offset, _left_padding = state
@@ -461,6 +463,29 @@ def trim_prompt_cache(prompt_cache: list, length: int) -> list:
             )
             if hasattr(copied, "offset"):
                 copied.offset = length
+        elif (
+            isinstance(state, list)
+            and hasattr(copied, "size")
+            and hasattr(copied, "trim")
+            and copied.is_trimmable()
+        ):
+            current_length = copied.size()
+            if current_length > length:
+                copied.trim(current_length - length)
+        elif isinstance(state, list):
+            child_types = [
+                type(child).__name__ for child in getattr(copied, "caches", [])
+            ]
+            shapes = [
+                getattr(item, "shape", None) for item in getattr(copied, "cache", [])
+            ]
+            raise TypeError(
+                "Unsupported prompt cache state: "
+                f"{type(state)!r} entry={type(copied).__name__} "
+                f"children={child_types} trimmable="
+                f"{getattr(copied, 'is_trimmable', lambda: None)()} "
+                f"shapes={shapes}"
+            )
         else:
             raise TypeError(f"Unsupported prompt cache state: {type(state)!r}")
         trimmed.append(copied)
@@ -1527,6 +1552,7 @@ class GenerationBatch:
         finish_reason: Optional[str]
         top_logprobs: Optional[List[Tuple[int, float]]] = None
         prompt_cache: Optional[List[Any]] = None
+        prefill_prompt_cache: Optional[List[Any]] = None
 
     def __init__(
         self,
@@ -1538,6 +1564,7 @@ class GenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         top_logprobs_k: int = 0,
+        prefill_prompt_caches: Optional[List[List[Any]]] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1546,6 +1573,7 @@ class GenerationBatch:
         self.sampler = sampler
         self.stop_criteria = stop_criteria
         self.max_tokens = max_tokens
+        self.prefill_prompt_caches = prefill_prompt_caches or [None] * len(uids)
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
@@ -1630,6 +1658,7 @@ class GenerationBatch:
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
+        self.prefill_prompt_caches.extend(other.prefill_prompt_caches)
         self._num_tokens.extend(other._num_tokens)
 
         if self._current_tokens is None:
@@ -1678,6 +1707,7 @@ class GenerationBatch:
         """Filter the batch to keep only the specified indices."""
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self.prefill_prompt_caches = [self.prefill_prompt_caches[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
 
         if not keep:
@@ -1727,6 +1757,9 @@ class GenerationBatch:
                 prompt_cache = None
             else:
                 prompt_cache = snapshot_prompt_cache(self.prompt_cache, i)
+            prefill_prompt_cache = (
+                self.prefill_prompt_caches[i] if self._num_tokens[i] == 1 else None
+            )
 
             top_lp = None
             if top_idx_list is not None:
@@ -1740,6 +1773,7 @@ class GenerationBatch:
                     finish_reason=finish_reason,
                     top_logprobs=top_lp,
                     prompt_cache=prompt_cache,
+                    prefill_prompt_cache=prefill_prompt_cache,
                 )
             )
 
@@ -1758,6 +1792,7 @@ class GenerationBatch:
         batch._language_model = getattr(model, "language_model", model)
         batch.uids = []
         batch.prompt_cache = []
+        batch.prefill_prompt_caches = []
         batch.sampler = sampler
         batch.stop_criteria = stop_criteria
         batch.max_tokens = []
@@ -1871,6 +1906,10 @@ class PromptProcessingBatch:
             stop_criteria=stop_criteria,
             max_tokens=list(self.max_tokens),
             top_logprobs_k=top_logprobs_k,
+            prefill_prompt_caches=[
+                snapshot_prompt_cache(self.prompt_cache, i)
+                for i in range(len(self.uids))
+            ],
         )
         gen_batch.compute_logprobs = compute_logprobs
 

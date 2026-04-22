@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import copy
 import gc
 import importlib
 import json
@@ -22,6 +23,7 @@ logger = logging.getLogger("mlx_vlm.server")
 generate_module = importlib.import_module("mlx_vlm.generate")
 
 import mlx.core as mx
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -200,8 +202,10 @@ class ResponseGenerator:
 
     def __init__(
         self,
-        model,
-        processor,
+        model=None,
+        processor=None,
+        model_path=None,
+        adapter_path=None,
         stop_tokens=None,
         vision_cache=None,
         draft_model=None,
@@ -213,6 +217,8 @@ class ResponseGenerator:
     ):
         self.model = model
         self.processor = processor
+        self.model_path = model_path
+        self.adapter_path = adapter_path
         self.stop_tokens = stop_tokens or set()
         self.vision_cache = vision_cache
         self.draft_model = draft_model
@@ -222,14 +228,23 @@ class ResponseGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            processor.tokenizer
+            if processor is not None and hasattr(processor, "tokenizer")
+            else processor
         )
         self.requests: Queue = Queue()
+        self._ready: Queue = Queue(maxsize=1)
         self._stop = False
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def wait_until_ready(self):
+        item = self._ready.get()
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def stop_and_join(self):
         self._stop = True
@@ -258,7 +273,7 @@ class ResponseGenerator:
 
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._detach_mx_arrays(self._cpu_preprocess(prompt, images, audio))
         prompt_tokens = (
             raw_inputs["input_ids"].size
             if hasattr(raw_inputs["input_ids"], "size")
@@ -318,6 +333,28 @@ class ResponseGenerator:
             add_special_tokens=add_special_tokens,
         )
 
+    def _detach_mx_arrays(self, value):
+        if isinstance(value, mx.array):
+            return np.array(value)
+        if isinstance(value, dict):
+            return {key: self._detach_mx_arrays(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._detach_mx_arrays(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._detach_mx_arrays(item) for item in value)
+        return value
+
+    def _reattach_mx_arrays(self, value):
+        if isinstance(value, np.ndarray):
+            return mx.array(value)
+        if isinstance(value, dict):
+            return {key: self._reattach_mx_arrays(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._reattach_mx_arrays(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._reattach_mx_arrays(item) for item in value)
+        return value
+
     # -- internals --
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
@@ -334,6 +371,7 @@ class ResponseGenerator:
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
+        raw_inputs = self._reattach_mx_arrays(raw_inputs)
         input_ids = raw_inputs.get("input_ids")
         pixel_values = raw_inputs.get("pixel_values")
         mask = raw_inputs.get("attention_mask")
@@ -367,13 +405,21 @@ class ResponseGenerator:
         gen_kwargs: dict,
         prompt_cache_state: Optional[PromptCacheState],
     ) -> Tuple[List[int], dict, Optional[list], int]:
-        """Trim a prompt to its uncached suffix and return a reusable cache."""
+        """Reuse a complete cached prefix and return only the uncached suffix."""
         full_ids = input_ids.squeeze(0).tolist()
         if prompt_cache_state is None or prompt_cache_state.cache is None:
             return full_ids, gen_kwargs, None, 0
 
         prefix_len = prompt_cache_state.find_prefix_length(full_ids)
         reusable_prefix_len = min(prefix_len, max(len(full_ids) - 1, 0))
+        if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+            print(
+                "CACHE_DEBUG",
+                f"prefix_len={prefix_len}",
+                f"full_len={len(full_ids)}",
+                f"reusable_prefix_len={reusable_prefix_len}",
+                flush=True,
+            )
         if reusable_prefix_len <= 0:
             return full_ids, gen_kwargs, None, 0
 
@@ -388,10 +434,22 @@ class ResponseGenerator:
             if isinstance(value, mx.array) and value.ndim >= 2:
                 trimmed_kwargs[key] = value[:, reusable_prefix_len:]
 
+        if reusable_prefix_len == len(prompt_cache_state.token_ids or []):
+            reusable_prompt_cache = copy.deepcopy(prompt_cache_state.cache)
+        else:
+            try:
+                reusable_prompt_cache = trim_prompt_cache(
+                    prompt_cache_state.cache, reusable_prefix_len
+                )
+            except TypeError as exc:
+                if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+                    print(f"CACHE_DEBUG trim_failed={exc}", flush=True)
+                return full_ids, gen_kwargs, None, 0
+
         return (
             full_ids[reusable_prefix_len:],
             trimmed_kwargs,
-            trim_prompt_cache(prompt_cache_state.cache, reusable_prefix_len),
+            reusable_prompt_cache,
             reusable_prefix_len,
         )
 
@@ -401,6 +459,23 @@ class ResponseGenerator:
         generation_stream = mx.default_stream(mx.default_device())
         mx.set_default_stream(generation_stream)
         generate_module.generation_stream = generation_stream
+
+        try:
+            if self.model is None:
+                self.model, self.processor, config = load_model_resources(
+                    self.model_path, self.adapter_path
+                )
+                self.stop_tokens = get_stop_tokens(config)
+            if self.tokenizer is None:
+                self.tokenizer = (
+                    self.processor.tokenizer
+                    if hasattr(self.processor, "tokenizer")
+                    else self.processor
+                )
+            self._ready.put(None)
+        except Exception as exc:
+            self._ready.put(exc)
+            return
 
         if self.draft_model is not None:
             self._run_speculative()
@@ -754,6 +829,14 @@ class ResponseGenerator:
 
             lp = r.token_logprob
             cached_prompt_tokens = info.get("cached_prompt_tokens", 0)
+            prompt_cache_state = info.get("prompt_cache_state")
+            if prompt_cache_state is not None and getattr(
+                r, "prefill_prompt_cache", None
+            ):
+                prompt_cache_state.update(
+                    info.get("input_ids", []),
+                    r.prefill_prompt_cache,
+                )
 
             rqueue.put(
                 StreamingToken(
@@ -768,12 +851,6 @@ class ResponseGenerator:
             )
 
             if r.finish_reason is not None:
-                prompt_cache_state = info.get("prompt_cache_state")
-                if prompt_cache_state is not None and getattr(r, "prompt_cache", None):
-                    prompt_cache_state.update(
-                        info.get("input_ids", []) + info["tokens"],
-                        r.prompt_cache,
-                    )
                 rqueue.put(None)
                 del active[r.uid]
 
@@ -1085,6 +1162,16 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
+def get_stop_tokens(config):
+    stop_tokens = set()
+    if hasattr(config, "eos_token_id"):
+        if isinstance(config.eos_token_id, list):
+            stop_tokens.update(config.eos_token_id)
+        elif config.eos_token_id is not None:
+            stop_tokens.add(config.eos_token_id)
+    return stop_tokens
+
+
 _INHERIT_ADAPTER = object()
 
 
@@ -1110,17 +1197,6 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     if model_cache:
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
-
-    # Load the model resources
-    model, processor, config = load_model_resources(model_path, adapter_path)
-
-    # Get stop tokens from model config
-    stop_tokens = set()
-    if hasattr(config, "eos_token_id"):
-        if isinstance(config.eos_token_id, list):
-            stop_tokens.update(config.eos_token_id)
-        elif config.eos_token_id is not None:
-            stop_tokens.add(config.eos_token_id)
 
     # Load speculative drafter if configured
     draft_model = None
@@ -1148,9 +1224,8 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     if prompt_cache_enabled():
         print("Persistent PromptCacheState mode enabled with continuous batching.")
     response_generator = ResponseGenerator(
-        model=model,
-        processor=processor,
-        stop_tokens=stop_tokens,
+        model_path=model_path,
+        adapter_path=adapter_path,
         vision_cache=vision_cache,
         draft_model=draft_model,
         kv_bits=kv_bits,
@@ -1159,6 +1234,10 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
     )
+    response_generator.wait_until_ready()
+    model = response_generator.model
+    processor = response_generator.processor
+    config = model.config
 
     model_cache = {
         "cache_key": cache_key,
