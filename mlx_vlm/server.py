@@ -789,6 +789,20 @@ def _build_gen_args(request) -> GenerationArguments:
     )
 
 
+def _server_generate_kwargs(model_path: str) -> dict:
+    """Server-level KV cache kwargs for non-batched fallback generation."""
+    kw = {
+        "kv_bits": get_quantized_kv_bits(model_path),
+        "kv_group_size": get_kv_group_size(),
+        "kv_quant_scheme": get_kv_quant_scheme(),
+        "quantized_kv_start": get_quantized_kv_start(),
+    }
+    max_kv_size = get_max_kv_size(model_path)
+    if max_kv_size is not None:
+        kw["max_kv_size"] = max_kv_size
+    return kw
+
+
 def _count_thinking_tag_tokens(text: str) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
@@ -929,7 +943,10 @@ async def lifespan(app):
         kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
         if kv_bits:
             logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Model ready, continuous batching enabled.")
+        logger.info(
+            "Model ready, continuous batching %s.",
+            "enabled" if response_generator is not None else "disabled",
+        )
     yield
 
 
@@ -1779,6 +1796,7 @@ async def responses_endpoint(request: Request):
                                 vision_cache=model_cache.get("vision_cache"),
                                 prompt_cache_state=prompt_cache_state,
                                 **gen_args.to_generate_kwargs(),
+                                **_server_generate_kwargs(openai_request.model),
                                 **kwargs,
                             )
 
@@ -1893,6 +1911,7 @@ async def responses_endpoint(request: Request):
                             vision_cache=model_cache.get("vision_cache"),
                             prompt_cache_state=prompt_cache_state,
                             **gen_args.to_generate_kwargs(),
+                            **_server_generate_kwargs(openai_request.model),
                             **kwargs,
                         )
                     full_text = result.text
@@ -2251,6 +2270,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 vision_cache=model_cache.get("vision_cache"),
                                 prompt_cache_state=prompt_cache_state,
                                 **gen_args.to_generate_kwargs(),
+                                **_server_generate_kwargs(request.model),
                                 **kwargs,
                             )
 
@@ -2381,6 +2401,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             vision_cache=model_cache.get("vision_cache"),
                             prompt_cache_state=prompt_cache_state,
                             **gen_args.to_generate_kwargs(),
+                            **_server_generate_kwargs(request.model),
                             **kwargs,
                         )
                     full_text = gen_result.text
