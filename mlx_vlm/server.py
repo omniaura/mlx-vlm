@@ -63,6 +63,23 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+def get_response_queue_timeout():
+    timeout = float(os.environ.get("MLX_VLM_RESPONSE_QUEUE_TIMEOUT", "0"))
+    return timeout if timeout > 0 else None
+
+
+def openai_stream_error_payload(exc: Exception, code: str = "internal_error"):
+    message = str(exc) or exc.__class__.__name__
+    return {
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": None,
+            "code": code,
+        }
+    }
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -296,9 +313,17 @@ class ResponseGenerator:
             # closes immediately after seeing finish_reason isn't treated
             # as a client abort.
             ended = False
+            queue_timeout = get_response_queue_timeout()
             try:
                 while True:
-                    item = rqueue.get(timeout=60.0)
+                    try:
+                        item = rqueue.get(timeout=queue_timeout)
+                    except QueueEmpty as exc:
+                        raise TimeoutError(
+                            "Timed out waiting for the next generated token. "
+                            "Increase MLX_VLM_RESPONSE_QUEUE_TIMEOUT or leave it "
+                            "unset to wait through long prefills."
+                        ) from exc
                     if item is None:
                         ended = True
                         break
@@ -2016,7 +2041,7 @@ async def responses_endpoint(request: Request):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps(openai_stream_error_payload(e))
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -2489,7 +2514,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps(openai_stream_error_payload(e))
                     yield f"data: {error_data}\n\n"
 
                 finally:
