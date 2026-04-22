@@ -789,6 +789,20 @@ def _build_gen_args(request) -> GenerationArguments:
     )
 
 
+def _server_generate_kwargs(model_path: str) -> dict:
+    """Server-level generation kwargs shared by batching and fallback paths."""
+    kw = {
+        "kv_bits": get_quantized_kv_bits(model_path),
+        "kv_group_size": get_kv_group_size(),
+        "kv_quant_scheme": get_kv_quant_scheme(),
+        "quantized_kv_start": get_quantized_kv_start(),
+    }
+    max_kv_size = get_max_kv_size(model_path)
+    if max_kv_size is not None:
+        kw["max_kv_size"] = max_kv_size
+    return kw
+
+
 def _count_thinking_tag_tokens(text: str) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
@@ -929,7 +943,10 @@ async def lifespan(app):
         kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
         if kv_bits:
             logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Model ready, continuous batching enabled.")
+        logger.info(
+            "Model ready, continuous batching %s.",
+            "enabled" if response_generator is not None else "disabled",
+        )
     yield
 
 
@@ -1770,31 +1787,57 @@ async def responses_endpoint(request: Request):
                                 break
                     else:
                         # Fallback to stream_generate
-                        with prompt_generation_lock:
-                            token_iterator = stream_generate(
-                                model=model,
-                                processor=processor,
-                                prompt=formatted_prompt,
-                                image=images,
-                                vision_cache=model_cache.get("vision_cache"),
-                                prompt_cache_state=prompt_cache_state,
-                                **gen_args.to_generate_kwargs(),
-                                **kwargs,
-                            )
+                        chunk_queue = Queue()
+                        done = object()
 
-                            for chunk in token_iterator:
-                                if chunk is None or not hasattr(chunk, "text"):
-                                    continue
+                        def _run_stream_generate():
+                            local_iterator = None
+                            try:
+                                with prompt_generation_lock:
+                                    local_iterator = stream_generate(
+                                        model=model,
+                                        processor=processor,
+                                        prompt=formatted_prompt,
+                                        image=images,
+                                        vision_cache=model_cache.get("vision_cache"),
+                                        prompt_cache_state=prompt_cache_state,
+                                        **gen_args.to_generate_kwargs(),
+                                        **_server_generate_kwargs(openai_request.model),
+                                        **kwargs,
+                                    )
+                                    for item in local_iterator:
+                                        chunk_queue.put(item)
+                            except Exception as exc:
+                                chunk_queue.put(exc)
+                            finally:
+                                if local_iterator is not None:
+                                    try:
+                                        local_iterator.close()
+                                    except Exception:
+                                        pass
+                                chunk_queue.put(done)
 
-                                delta = chunk.text
-                                full_text += delta
-                                usage_stats = {
-                                    "input_tokens": chunk.prompt_tokens,
-                                    "output_tokens": chunk.generation_tokens,
-                                }
+                        Thread(target=_run_stream_generate, daemon=True).start()
 
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                                await asyncio.sleep(0.01)
+                        while True:
+                            item = await asyncio.to_thread(chunk_queue.get)
+                            if item is done:
+                                break
+                            if isinstance(item, Exception):
+                                raise item
+                            chunk = item
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            delta = chunk.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": chunk.prompt_tokens,
+                                "output_tokens": chunk.generation_tokens,
+                            }
+
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
 
                     # Split thinking from content for final events
                     _, clean_text = _split_thinking(full_text)
@@ -1883,18 +1926,24 @@ async def responses_endpoint(request: Request):
                     except Exception:
                         pass
                 else:
-                    with prompt_generation_lock:
-                        result = generate(
-                            model=model,
-                            processor=processor,
-                            prompt=formatted_prompt,
-                            image=images,
-                            verbose=logger.isEnabledFor(logging.DEBUG),
-                            vision_cache=model_cache.get("vision_cache"),
-                            prompt_cache_state=prompt_cache_state,
-                            **gen_args.to_generate_kwargs(),
-                            **kwargs,
-                        )
+                    def _blocking_generate_with_prompt_cache():
+                        with prompt_generation_lock:
+                            return generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                verbose=logger.isEnabledFor(logging.DEBUG),
+                                vision_cache=model_cache.get("vision_cache"),
+                                prompt_cache_state=prompt_cache_state,
+                                **gen_args.to_generate_kwargs(),
+                                **_server_generate_kwargs(openai_request.model),
+                                **kwargs,
+                            )
+
+                    result = await asyncio.to_thread(
+                        _blocking_generate_with_prompt_cache
+                    )
                     full_text = result.text
                     prompt_tokens = result.prompt_tokens
                     output_tokens = result.generation_tokens
@@ -2241,52 +2290,79 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
                         # Fallback to stream_generate
-                        with prompt_generation_lock:
-                            token_iterator = stream_generate(
-                                model=model,
-                                processor=processor,
-                                prompt=formatted_prompt,
-                                image=images,
-                                audio=audio,
-                                vision_cache=model_cache.get("vision_cache"),
-                                prompt_cache_state=prompt_cache_state,
-                                **gen_args.to_generate_kwargs(),
-                                **kwargs,
+                        chunk_queue = Queue()
+                        done = object()
+
+                        def _run_stream_generate():
+                            local_iterator = None
+                            try:
+                                with prompt_generation_lock:
+                                    local_iterator = stream_generate(
+                                        model=model,
+                                        processor=processor,
+                                        prompt=formatted_prompt,
+                                        image=images,
+                                        audio=audio,
+                                        vision_cache=model_cache.get("vision_cache"),
+                                        prompt_cache_state=prompt_cache_state,
+                                        **gen_args.to_generate_kwargs(),
+                                        **_server_generate_kwargs(request.model),
+                                        **kwargs,
+                                    )
+                                    for item in local_iterator:
+                                        chunk_queue.put(item)
+                            except Exception as exc:
+                                chunk_queue.put(exc)
+                            finally:
+                                if local_iterator is not None:
+                                    try:
+                                        local_iterator.close()
+                                    except Exception:
+                                        pass
+                                chunk_queue.put(done)
+
+                        Thread(target=_run_stream_generate, daemon=True).start()
+
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        output_text = ""
+                        while True:
+                            item = await asyncio.to_thread(chunk_queue.get)
+                            if item is done:
+                                break
+                            if isinstance(item, Exception):
+                                raise item
+                            chunk = item
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            output_text += chunk.text
+                            output_tokens = chunk.generation_tokens
+
+                            choices = [
+                                ChatStreamChoice(
+                                    delta=ChatMessage(
+                                        role="assistant", content=chunk.text
+                                    )
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                usage={
+                                    "prompt_tokens": chunk.prompt_tokens,
+                                    "completion_tokens": chunk.generation_tokens,
+                                    "total_tokens": chunk.prompt_tokens
+                                    + chunk.generation_tokens,
+                                    "prompt_tokens_details": {
+                                        "cached_tokens": chunk.cached_prompt_tokens,
+                                    },
+                                },
+                                choices=choices,
                             )
 
-                            request_id = f"chatcmpl-{uuid.uuid4()}"
-                            output_text = ""
-                            for chunk in token_iterator:
-                                if chunk is None or not hasattr(chunk, "text"):
-                                    continue
-
-                                output_text += chunk.text
-
-                                choices = [
-                                    ChatStreamChoice(
-                                        delta=ChatMessage(
-                                            role="assistant", content=chunk.text
-                                        )
-                                    )
-                                ]
-                                chunk_data = ChatStreamChunk(
-                                    id=request_id,
-                                    created=int(time.time()),
-                                    model=request.model,
-                                    usage={
-                                        "prompt_tokens": chunk.prompt_tokens,
-                                        "completion_tokens": chunk.generation_tokens,
-                                        "total_tokens": chunk.prompt_tokens
-                                        + chunk.generation_tokens,
-                                        "prompt_tokens_details": {
-                                            "cached_tokens": chunk.cached_prompt_tokens,
-                                        },
-                                    },
-                                    choices=choices,
-                                )
-
-                                yield f"data: {chunk_data.model_dump_json()}\n\n"
-                                await asyncio.sleep(0.01)
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
 
                     # Signal stream end
                     yield "data: [DONE]\n\n"
@@ -2370,19 +2446,25 @@ async def chat_completions_endpoint(request: ChatRequest):
                         await asyncio.to_thread(_blocking_generate)
                     )
                 else:
-                    with prompt_generation_lock:
-                        gen_result = generate(
-                            model=model,
-                            processor=processor,
-                            prompt=formatted_prompt,
-                            image=images,
-                            audio=audio,
-                            verbose=logger.isEnabledFor(logging.DEBUG),
-                            vision_cache=model_cache.get("vision_cache"),
-                            prompt_cache_state=prompt_cache_state,
-                            **gen_args.to_generate_kwargs(),
-                            **kwargs,
-                        )
+                    def _blocking_generate_with_prompt_cache():
+                        with prompt_generation_lock:
+                            return generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                audio=audio,
+                                verbose=logger.isEnabledFor(logging.DEBUG),
+                                vision_cache=model_cache.get("vision_cache"),
+                                prompt_cache_state=prompt_cache_state,
+                                **gen_args.to_generate_kwargs(),
+                                **_server_generate_kwargs(request.model),
+                                **kwargs,
+                            )
+
+                    gen_result = await asyncio.to_thread(
+                        _blocking_generate_with_prompt_cache
+                    )
                     full_text = gen_result.text
                     prompt_tokens = gen_result.prompt_tokens
                     output_tokens = gen_result.generation_tokens
