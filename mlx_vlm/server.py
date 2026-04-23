@@ -285,6 +285,7 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
         prompt_cache_state: Optional[PromptCacheState] = None,
         cache_prefix_prompt: Optional[str] = None,
+        cache_snapshot_suffix: Optional[str] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
         args = args or GenerationArguments()
         rqueue: Queue = Queue()
@@ -293,7 +294,28 @@ class ResponseGenerator:
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._detach_mx_arrays(self._cpu_preprocess(prompt, images, audio))
         cache_snapshot_len = None
-        if cache_prefix_prompt and prompt_cache_state is not None:
+        if cache_snapshot_suffix and prompt_cache_state is not None:
+            tokenizer = (
+                self.processor.tokenizer
+                if hasattr(self.processor, "tokenizer")
+                else self.processor
+            )
+            suffix_ids = tokenizer.encode(
+                cache_snapshot_suffix, add_special_tokens=False
+            )
+            full_ids = (
+                raw_inputs["input_ids"].reshape(-1).tolist()
+                if hasattr(raw_inputs["input_ids"], "reshape")
+                else list(raw_inputs["input_ids"])
+            )
+            if suffix_ids and full_ids[-len(suffix_ids) :] == suffix_ids:
+                cache_snapshot_len = len(full_ids) - len(suffix_ids)
+
+        if (
+            cache_snapshot_len is None
+            and cache_prefix_prompt
+            and prompt_cache_state is not None
+        ):
             prefix_inputs = self._detach_mx_arrays(
                 self._cpu_preprocess(cache_prefix_prompt, images, audio)
             )
@@ -2387,6 +2409,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                             gen_args,
                             prompt_cache_state,
                             cache_prefix_prompt,
+                            "<think>\n\n</think>\n\n"
+                            if not gen_args.enable_thinking
+                            else None,
                         )
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -2634,6 +2659,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             args=gen_args,
                             prompt_cache_state=prompt_cache_state,
                             cache_prefix_prompt=cache_prefix_prompt,
+                            cache_snapshot_suffix=(
+                                "<think>\n\n</think>\n\n"
+                                if not gen_args.enable_thinking
+                                else None
+                            ),
                         )
                         pt = ctx.prompt_tokens
                         cached = ctx.cached_prompt_tokens
