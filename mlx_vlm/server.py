@@ -10,7 +10,7 @@ import re
 import time
 import traceback
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -142,6 +142,10 @@ def get_prompt_cache_size():
     return max(1, int(os.environ.get("MLX_VLM_PROMPT_CACHE_SIZE", "8")))
 
 
+def get_observability_event_limit():
+    return max(1, int(os.environ.get("MLX_VLM_OBSERVABILITY_EVENTS", "64")))
+
+
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
 # =============================================================================
@@ -262,6 +266,33 @@ class ResponseGenerator:
         self._stop = False
         self._cancelled: set = set()
         self._cancel_lock = Lock()
+        self._metrics_lock = Lock()
+        self._metrics = {
+            "requests_total": 0,
+            "queued_batches_total": 0,
+            "queued_items_total": 0,
+            "max_queue_batch_size": 0,
+            "batch_steps_total": 0,
+            "response_tokens_total": 0,
+            "finished_requests_total": 0,
+            "cancelled_requests_total": 0,
+            "errors_total": 0,
+            "cache_hits_total": 0,
+            "cache_trim_hits_total": 0,
+            "cache_misses_total": 0,
+            "cache_miss_empty_cache_total": 0,
+            "cache_miss_no_prefix_total": 0,
+            "cache_miss_empty_suffix_total": 0,
+            "cache_miss_trim_failed_total": 0,
+            "cached_prompt_tokens_total": 0,
+            "prefill_snapshots_total": 0,
+            "generation_snapshots_total": 0,
+            "completed_snapshots_total": 0,
+            "max_active_requests": 0,
+            "max_prompt_tokens": 0,
+        }
+        self._events = deque(maxlen=get_observability_event_limit())
+        self._started_at = time.time()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -284,6 +315,41 @@ class ResponseGenerator:
         with self._cancel_lock:
             pending, self._cancelled = self._cancelled, set()
             return pending
+
+    def _inc_metric(self, key: str, amount: int = 1):
+        with self._metrics_lock:
+            self._metrics[key] = self._metrics.get(key, 0) + amount
+
+    def _max_metric(self, key: str, value: int):
+        with self._metrics_lock:
+            self._metrics[key] = max(self._metrics.get(key, 0), value)
+
+    def _record_event(self, event: str, **fields):
+        item = {"ts": round(time.time(), 3), "event": event}
+        item.update(fields)
+        with self._metrics_lock:
+            self._events.append(item)
+
+    def observability_snapshot(self) -> dict:
+        with self._metrics_lock:
+            metrics = dict(self._metrics)
+            events = list(self._events)
+        return {
+            "thread_alive": self._thread.is_alive(),
+            "uptime_seconds": round(time.time() - self._started_at, 3),
+            "request_queue_size": self.requests.qsize(),
+            "config": {
+                "kv_bits": self.kv_bits,
+                "kv_group_size": self.kv_group_size,
+                "kv_quant_scheme": self.kv_quant_scheme,
+                "quantized_kv_start": self.quantized_kv_start,
+                "prompt_cache_enabled": prompt_cache_enabled(),
+                "prompt_cache_size": get_prompt_cache_size(),
+                "generation_snapshot_limit": get_generation_snapshot_limit(),
+            },
+            "metrics": metrics,
+            "recent_events": events,
+        }
 
     def generate(
         self,
@@ -336,6 +402,8 @@ class ResponseGenerator:
             if hasattr(raw_inputs["input_ids"], "size")
             else len(raw_inputs["input_ids"])
         )
+        self._inc_metric("requests_total")
+        self._max_metric("max_prompt_tokens", int(prompt_tokens))
 
         self.requests.put(
             (
@@ -481,6 +549,13 @@ class ResponseGenerator:
         """Reuse a complete cached prefix and return only the uncached suffix."""
         full_ids = input_ids.squeeze(0).tolist()
         if prompt_cache_state is None or prompt_cache_state.cache is None:
+            self._inc_metric("cache_misses_total")
+            self._inc_metric("cache_miss_empty_cache_total")
+            self._record_event(
+                "cache_miss",
+                reason="empty_cache",
+                full_len=len(full_ids),
+            )
             return full_ids, gen_kwargs, None, 0
 
         if hasattr(prompt_cache_state, "best_prefix_match"):
@@ -511,6 +586,14 @@ class ResponseGenerator:
                 flush=True,
             )
         if reusable_prefix_len <= 0:
+            self._inc_metric("cache_misses_total")
+            self._inc_metric("cache_miss_no_prefix_total")
+            self._record_event(
+                "cache_miss",
+                reason="no_prefix",
+                full_len=len(full_ids),
+                matched_len=len(matched_token_ids or []),
+            )
             if cache_debug_enabled():
                 print("CACHE_DEBUG reuse=miss reason=no_prefix", flush=True)
             return full_ids, gen_kwargs, None, 0
@@ -518,6 +601,14 @@ class ResponseGenerator:
         trimmed_kwargs = dict(gen_kwargs)
         inputs_embeds = trimmed_kwargs.get("inputs_embeds")
         if inputs_embeds is None or inputs_embeds.shape[1] <= reusable_prefix_len:
+            self._inc_metric("cache_misses_total")
+            self._inc_metric("cache_miss_empty_suffix_total")
+            self._record_event(
+                "cache_miss",
+                reason="empty_suffix",
+                full_len=len(full_ids),
+                reusable_prefix_len=reusable_prefix_len,
+            )
             if cache_debug_enabled():
                 print("CACHE_DEBUG reuse=miss reason=empty_suffix", flush=True)
             return full_ids, gen_kwargs, None, 0
@@ -530,6 +621,14 @@ class ResponseGenerator:
 
         if reusable_prefix_len == len(matched_token_ids or []):
             reusable_prompt_cache = copy.deepcopy(matched_cache)
+            self._inc_metric("cache_hits_total")
+            self._inc_metric("cached_prompt_tokens_total", reusable_prefix_len)
+            self._record_event(
+                "cache_hit",
+                kind="exact",
+                full_len=len(full_ids),
+                cached_tokens=reusable_prefix_len,
+            )
             if cache_debug_enabled():
                 print(
                     "CACHE_DEBUG",
@@ -542,6 +641,16 @@ class ResponseGenerator:
                     matched_cache, reusable_prefix_len
                 )
             except TypeError as exc:
+                self._inc_metric("cache_misses_total")
+                self._inc_metric("cache_miss_trim_failed_total")
+                self._record_event(
+                    "cache_miss",
+                    reason="trim_failed",
+                    full_len=len(full_ids),
+                    reusable_prefix_len=reusable_prefix_len,
+                    matched_len=len(matched_token_ids or []),
+                    error=str(exc),
+                )
                 if cache_debug_enabled():
                     print(
                         "CACHE_DEBUG",
@@ -551,6 +660,16 @@ class ResponseGenerator:
                         flush=True,
                     )
                 return full_ids, gen_kwargs, None, 0
+            self._inc_metric("cache_hits_total")
+            self._inc_metric("cache_trim_hits_total")
+            self._inc_metric("cached_prompt_tokens_total", reusable_prefix_len)
+            self._record_event(
+                "cache_hit",
+                kind="trimmed",
+                full_len=len(full_ids),
+                cached_tokens=reusable_prefix_len,
+                matched_len=len(matched_token_ids or []),
+            )
             if cache_debug_enabled():
                 print(
                     "CACHE_DEBUG",
@@ -634,6 +753,7 @@ class ResponseGenerator:
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
                 if cancelled and batch_gen is not None:
+                    self._inc_metric("cancelled_requests_total", len(cancelled))
                     for uid in cancelled:
                         if uid in active:
                             batch_gen.remove(uid)
@@ -642,6 +762,17 @@ class ResponseGenerator:
                                 info["rqueue"].put(None)
                             except Exception:
                                 pass
+
+                if new_items:
+                    self._inc_metric("queued_batches_total")
+                    self._inc_metric("queued_items_total", len(new_items))
+                    self._max_metric("max_queue_batch_size", len(new_items))
+                    if len(new_items) > 1:
+                        self._record_event(
+                            "queued_batch",
+                            size=len(new_items),
+                            active=len(active),
+                        )
 
                 for (
                     rqueue,
@@ -716,6 +847,7 @@ class ResponseGenerator:
                         "cached_prompt_tokens": cached_prompt_tokens,
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
+                    self._max_metric("max_active_requests", len(active))
 
                     if has_embeds:
                         self._step(batch_gen, active)
@@ -726,6 +858,8 @@ class ResponseGenerator:
                 self._step(batch_gen, active)
 
             except Exception as e:
+                self._inc_metric("errors_total")
+                self._record_event("generation_error", error=str(e))
                 print(f"Error in generation thread: {e}")
                 traceback.print_exc()
                 for uid, info in list(active.items()):
@@ -926,10 +1060,12 @@ class ResponseGenerator:
         _, responses = batch_gen.next(**kwargs)
         if not responses:
             return
+        self._inc_metric("batch_steps_total")
 
         for r in responses:
             if r.uid not in active:
                 continue
+            self._inc_metric("response_tokens_total")
 
             info = active[r.uid]
             rqueue = info["rqueue"]
@@ -961,6 +1097,12 @@ class ResponseGenerator:
                     r.prefill_prompt_cache,
                     label="prefill",
                 )
+                self._inc_metric("prefill_snapshots_total")
+                self._record_event(
+                    "cache_store",
+                    label="prefill",
+                    token_len=len(prefill_token_ids),
+                )
                 if cache_debug_enabled():
                     print(
                         "CACHE_DEBUG",
@@ -975,6 +1117,15 @@ class ResponseGenerator:
                     completed_ids.append(tok)
                 label = "completed" if r.finish_reason is not None else "gen"
                 prompt_cache_state.update(completed_ids, r.prompt_cache, label=label)
+                if label == "completed":
+                    self._inc_metric("completed_snapshots_total")
+                    self._record_event(
+                        "cache_store",
+                        label=label,
+                        token_len=len(completed_ids),
+                    )
+                else:
+                    self._inc_metric("generation_snapshots_total")
                 if cache_debug_enabled():
                     print(
                         "CACHE_DEBUG",
@@ -995,6 +1146,7 @@ class ResponseGenerator:
             )
 
             if r.finish_reason is not None:
+                self._inc_metric("finished_requests_total")
                 rqueue.put(None)
                 del active[r.uid]
 
@@ -1237,6 +1389,28 @@ def get_prompt_cache_state(
 def clear_prompt_cache_states():
     with prompt_cache_lock:
         prompt_cache_states.clear()
+
+
+def prompt_cache_observability_snapshot() -> list:
+    with prompt_cache_lock:
+        items = []
+        for (model_path, adapter_path, cache_id), state in prompt_cache_states.items():
+            token_ids = getattr(state, "token_ids", None)
+            snapshots = getattr(state, "snapshots", [])
+            items.append(
+                {
+                    "model": model_path,
+                    "adapter": adapter_path,
+                    "cache_id": cache_id,
+                    "current_tokens": len(token_ids or []),
+                    "snapshot_count": len(snapshots),
+                    "snapshots": [
+                        {"label": label, "tokens": len(ids)}
+                        for ids, _cache, label in snapshots
+                    ],
+                }
+            )
+        return items
 
 
 @asynccontextmanager
@@ -2919,6 +3093,28 @@ async def health_check():
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
         "continuous_batching_enabled": response_generator is not None,
+        "prompt_cache_enabled": prompt_cache_enabled(),
+        "kv_bits": get_quantized_kv_bits(model_cache.get("model_path", "") or ""),
+        "kv_quant_scheme": get_kv_quant_scheme(),
+        "generation_snapshot_limit": get_generation_snapshot_limit(),
+    }
+
+
+@app.get("/observability")
+@app.get("/v1/observability", include_in_schema=False)
+async def observability_check():
+    """
+    Return lightweight runtime counters for prompt cache and batching behavior.
+    """
+    generator = response_generator.observability_snapshot() if response_generator else None
+    return {
+        "status": "healthy" if response_generator is not None else "no_model_loaded",
+        "loaded_model": model_cache.get("model_path", None),
+        "loaded_adapter": model_cache.get("adapter_path", None),
+        "continuous_batching_enabled": response_generator is not None,
+        "prompt_cache_enabled": prompt_cache_enabled(),
+        "prompt_cache_states": prompt_cache_observability_snapshot(),
+        "response_generator": generator,
     }
 
 
@@ -3049,7 +3245,7 @@ def main():
         default=False,
         help=(
             "Persist PromptCacheState across HTTP requests for common-prefix "
-            "reuse. This disables continuous batching."
+            "reuse while keeping continuous batching enabled."
         ),
     )
     parser.add_argument(
