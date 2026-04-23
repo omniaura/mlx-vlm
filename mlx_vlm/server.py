@@ -68,6 +68,14 @@ def get_response_queue_timeout():
     return timeout if timeout > 0 else None
 
 
+def cache_debug_enabled():
+    return os.environ.get("MLX_VLM_CACHE_DEBUG") == "1"
+
+
+def get_generation_snapshot_limit():
+    return max(int(os.environ.get("MLX_VLM_GENERATION_CACHE_SNAPSHOTS", "8")), 0)
+
+
 def openai_stream_error_payload(exc: Exception, code: str = "internal_error"):
     message = str(exc) or exc.__class__.__name__
     return {
@@ -487,21 +495,31 @@ class ResponseGenerator:
             matched_cache = prompt_cache_state.cache
 
         reusable_prefix_len = min(prefix_len, max(len(full_ids) - 1, 0))
-        if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+        if cache_debug_enabled():
+            snapshot_summary = (
+                prompt_cache_state.snapshot_summary()
+                if hasattr(prompt_cache_state, "snapshot_summary")
+                else ""
+            )
             print(
                 "CACHE_DEBUG",
                 f"prefix_len={prefix_len}",
                 f"full_len={len(full_ids)}",
                 f"reusable_prefix_len={reusable_prefix_len}",
                 f"matched_len={len(matched_token_ids or [])}",
+                f"snapshots=[{snapshot_summary}]",
                 flush=True,
             )
         if reusable_prefix_len <= 0:
+            if cache_debug_enabled():
+                print("CACHE_DEBUG reuse=miss reason=no_prefix", flush=True)
             return full_ids, gen_kwargs, None, 0
 
         trimmed_kwargs = dict(gen_kwargs)
         inputs_embeds = trimmed_kwargs.get("inputs_embeds")
         if inputs_embeds is None or inputs_embeds.shape[1] <= reusable_prefix_len:
+            if cache_debug_enabled():
+                print("CACHE_DEBUG reuse=miss reason=empty_suffix", flush=True)
             return full_ids, gen_kwargs, None, 0
 
         trimmed_kwargs["inputs_embeds"] = inputs_embeds[:, reusable_prefix_len:, :]
@@ -512,15 +530,33 @@ class ResponseGenerator:
 
         if reusable_prefix_len == len(matched_token_ids or []):
             reusable_prompt_cache = copy.deepcopy(matched_cache)
+            if cache_debug_enabled():
+                print(
+                    "CACHE_DEBUG",
+                    f"reuse=hit cached_tokens={reusable_prefix_len}",
+                    flush=True,
+                )
         else:
             try:
                 reusable_prompt_cache = trim_prompt_cache(
                     matched_cache, reusable_prefix_len
                 )
             except TypeError as exc:
-                if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
-                    print(f"CACHE_DEBUG trim_failed={exc}", flush=True)
+                if cache_debug_enabled():
+                    print(
+                        "CACHE_DEBUG",
+                        "reuse=miss",
+                        f"reason=trim_failed delta={len(matched_token_ids or []) - reusable_prefix_len}",
+                        f"error={exc}",
+                        flush=True,
+                    )
                 return full_ids, gen_kwargs, None, 0
+            if cache_debug_enabled():
+                print(
+                    "CACHE_DEBUG",
+                    f"reuse=hit_trimmed cached_tokens={reusable_prefix_len}",
+                    flush=True,
+                )
 
         return (
             full_ids[reusable_prefix_len:],
@@ -627,6 +663,7 @@ class ResponseGenerator:
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
                             top_logprobs_k=self.top_logprobs_k,
+                            generation_snapshot_limit=get_generation_snapshot_limit(),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -922,8 +959,9 @@ class ResponseGenerator:
                 prompt_cache_state.update(
                     prefill_token_ids,
                     r.prefill_prompt_cache,
+                    label="prefill",
                 )
-                if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+                if cache_debug_enabled():
                     print(
                         "CACHE_DEBUG",
                         f"stored=prefill len={len(prefill_token_ids)}",
@@ -935,11 +973,12 @@ class ResponseGenerator:
                 completed_ids.extend(info.get("tokens", []))
                 if r.finish_reason == "stop":
                     completed_ids.append(tok)
-                prompt_cache_state.update(completed_ids, r.prompt_cache)
-                if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+                label = "completed" if r.finish_reason is not None else "gen"
+                prompt_cache_state.update(completed_ids, r.prompt_cache, label=label)
+                if cache_debug_enabled():
                     print(
                         "CACHE_DEBUG",
-                        f"stored=completed len={len(completed_ids)}",
+                        f"stored={label} len={len(completed_ids)}",
                         flush=True,
                     )
 

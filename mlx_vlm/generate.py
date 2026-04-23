@@ -4,6 +4,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -394,7 +395,10 @@ class PromptCacheState:
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
         self.last_reused_prefix_len: int = 0
-        self.snapshots: List[Tuple[List[int], List[Any]]] = []
+        self.snapshots: List[Tuple[List[int], List[Any], str]] = []
+
+    def _max_snapshots(self) -> int:
+        return max(int(os.environ.get("MLX_VLM_PROMPT_CACHE_SNAPSHOT_LIMIT", "32")), 1)
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -415,9 +419,9 @@ class PromptCacheState:
         best_cache = None
         candidates = list(self.snapshots)
         if self.token_ids is not None and self.cache is not None:
-            candidates.append((self.token_ids, self.cache))
+            candidates.append((self.token_ids, self.cache, "current"))
 
-        for token_ids, cache in candidates:
+        for token_ids, cache, _label in candidates:
             max_len = min(len(token_ids), len(new_ids))
             prefix_len = 0
             for i in range(max_len):
@@ -431,12 +435,15 @@ class PromptCacheState:
 
         return best_prefix_len, best_token_ids, best_cache
 
-    def update(self, token_ids: list, kv_cache: list):
+    def update(self, token_ids: list, kv_cache: list, label: str = "cache"):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
-        self.snapshots.append((self.token_ids, self.cache))
-        self.snapshots = self.snapshots[-4:]
+        self.snapshots.append((self.token_ids, self.cache, label))
+        self.snapshots = self.snapshots[-self._max_snapshots() :]
+
+    def snapshot_summary(self) -> str:
+        return ",".join(f"{label}:{len(token_ids)}" for token_ids, _cache, label in self.snapshots)
 
 
 def _slice_cache_tokens(value, length: int):
@@ -1593,6 +1600,7 @@ class GenerationBatch:
         max_tokens: List[int],
         top_logprobs_k: int = 0,
         prefill_prompt_caches: Optional[List[List[Any]]] = None,
+        generation_snapshot_limit: int = 0,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1602,6 +1610,7 @@ class GenerationBatch:
         self.stop_criteria = stop_criteria
         self.max_tokens = max_tokens
         self.prefill_prompt_caches = prefill_prompt_caches or [None] * len(uids)
+        self.generation_snapshot_limit = generation_snapshot_limit
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
@@ -1687,6 +1696,9 @@ class GenerationBatch:
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
         self.prefill_prompt_caches.extend(other.prefill_prompt_caches)
+        self.generation_snapshot_limit = max(
+            self.generation_snapshot_limit, other.generation_snapshot_limit
+        )
         self._num_tokens.extend(other._num_tokens)
 
         if self._current_tokens is None:
@@ -1782,7 +1794,12 @@ class GenerationBatch:
 
             if finish_reason is None:
                 keep.append(i)
-                prompt_cache = None
+                prompt_cache = (
+                    snapshot_prompt_cache(self.prompt_cache, i)
+                    if self.generation_snapshot_limit > 0
+                    and self._num_tokens[i] <= self.generation_snapshot_limit
+                    else None
+                )
             else:
                 prompt_cache = snapshot_prompt_cache(self.prompt_cache, i)
             prefill_prompt_cache = (
@@ -1824,6 +1841,7 @@ class GenerationBatch:
         batch.sampler = sampler
         batch.stop_criteria = stop_criteria
         batch.max_tokens = []
+        batch.generation_snapshot_limit = 0
         batch._num_tokens = []
         batch.compute_logprobs = compute_logprobs
         batch.top_logprobs_k = top_logprobs_k
@@ -1860,6 +1878,7 @@ class PromptProcessingBatch:
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         prompt_cache: Optional[List[Any]] = None,
         cache_snapshot_lengths: Optional[List[Optional[int]]] = None,
+        generation_snapshot_limit: int = 0,
     ):
         self.model = model
         self.uids = uids
@@ -1877,6 +1896,7 @@ class PromptProcessingBatch:
         self._processed_tokens = 0
         self._cache_snapshot_lengths = cache_snapshot_lengths or [None] * len(uids)
         self._cache_snapshots = [None] * len(uids)
+        self.generation_snapshot_limit = generation_snapshot_limit
 
         self.prompt_cache = prompt_cache or _make_cache(
             model,
@@ -1971,6 +1991,7 @@ class PromptProcessingBatch:
                 else snapshot_prompt_cache(self.prompt_cache, i)
                 for i in range(len(self.uids))
             ],
+            generation_snapshot_limit=self.generation_snapshot_limit,
         )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -2033,6 +2054,7 @@ class BatchGenerator:
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
         compute_logprobs: bool = True,
         top_logprobs_k: int = 0,
+        generation_snapshot_limit: int = 0,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2043,6 +2065,7 @@ class BatchGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
+        self.generation_snapshot_limit = generation_snapshot_limit
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -2264,6 +2287,7 @@ class BatchGenerator:
                 kv_quant_scheme=self.kv_quant_scheme,
                 prompt_cache=prompt_caches[0] if len(prompt_caches) == 1 else None,
                 cache_snapshot_lengths=cache_snapshot_lengths,
+                generation_snapshot_limit=self.generation_snapshot_limit,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
