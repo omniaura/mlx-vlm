@@ -564,7 +564,17 @@ class ResponseGenerator:
             )
             return full_ids, gen_kwargs, None, 0
 
-        if hasattr(prompt_cache_state, "best_prefix_match"):
+        max_reusable_prefix_len = max(len(full_ids) - 1, 0)
+        if hasattr(prompt_cache_state, "best_reusable_prefix_match"):
+            (
+                prefix_len,
+                matched_token_ids,
+                matched_cache,
+            ) = prompt_cache_state.best_reusable_prefix_match(
+                full_ids,
+                max_reusable_prefix_len,
+            )
+        elif hasattr(prompt_cache_state, "best_prefix_match"):
             (
                 prefix_len,
                 matched_token_ids,
@@ -575,7 +585,7 @@ class ResponseGenerator:
             matched_token_ids = prompt_cache_state.token_ids
             matched_cache = prompt_cache_state.cache
 
-        reusable_prefix_len = min(prefix_len, max(len(full_ids) - 1, 0))
+        reusable_prefix_len = min(prefix_len, max_reusable_prefix_len)
         if cache_debug_enabled():
             snapshot_summary = (
                 prompt_cache_state.snapshot_summary()

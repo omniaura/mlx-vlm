@@ -435,6 +435,28 @@ class PromptCacheState:
 
         return best_prefix_len, best_token_ids, best_cache
 
+    def best_reusable_prefix_match(
+        self, new_ids: list, max_prefix_len: int
+    ) -> Tuple[int, Optional[List[int]], Optional[List[Any]]]:
+        """Return the longest exact cached prefix that can be reused as-is."""
+        best_prefix_len = 0
+        best_token_ids = None
+        best_cache = None
+        candidates = list(self.snapshots)
+        if self.token_ids is not None and self.cache is not None:
+            candidates.append((self.token_ids, self.cache, "current"))
+
+        for token_ids, cache, _label in candidates:
+            token_len = len(token_ids)
+            if token_len > max_prefix_len or token_len > len(new_ids):
+                continue
+            if token_ids == new_ids[:token_len] and token_len > best_prefix_len:
+                best_prefix_len = token_len
+                best_token_ids = token_ids
+                best_cache = cache
+
+        return best_prefix_len, best_token_ids, best_cache
+
     def update(self, token_ids: list, kv_cache: list, label: str = "cache"):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
