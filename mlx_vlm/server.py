@@ -146,6 +146,9 @@ def get_observability_event_limit():
     return max(1, int(os.environ.get("MLX_VLM_OBSERVABILITY_EVENTS", "64")))
 
 
+tokenizer_lock = Lock()
+
+
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
 # =============================================================================
@@ -366,37 +369,40 @@ class ResponseGenerator:
 
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
-        raw_inputs = self._detach_mx_arrays(self._cpu_preprocess(prompt, images, audio))
-        cache_snapshot_len = None
-        if cache_snapshot_suffix and prompt_cache_state is not None:
-            tokenizer = (
-                self.processor.tokenizer
-                if hasattr(self.processor, "tokenizer")
-                else self.processor
+        with tokenizer_lock:
+            raw_inputs = self._detach_mx_arrays(
+                self._cpu_preprocess(prompt, images, audio)
             )
-            suffix_ids = tokenizer.encode(
-                cache_snapshot_suffix, add_special_tokens=False
-            )
-            full_ids = (
-                raw_inputs["input_ids"].reshape(-1).tolist()
-                if hasattr(raw_inputs["input_ids"], "reshape")
-                else list(raw_inputs["input_ids"])
-            )
-            if suffix_ids and full_ids[-len(suffix_ids) :] == suffix_ids:
-                cache_snapshot_len = len(full_ids) - len(suffix_ids)
+            cache_snapshot_len = None
+            if cache_snapshot_suffix and prompt_cache_state is not None:
+                tokenizer = (
+                    self.processor.tokenizer
+                    if hasattr(self.processor, "tokenizer")
+                    else self.processor
+                )
+                suffix_ids = tokenizer.encode(
+                    cache_snapshot_suffix, add_special_tokens=False
+                )
+                full_ids = (
+                    raw_inputs["input_ids"].reshape(-1).tolist()
+                    if hasattr(raw_inputs["input_ids"], "reshape")
+                    else list(raw_inputs["input_ids"])
+                )
+                if suffix_ids and full_ids[-len(suffix_ids) :] == suffix_ids:
+                    cache_snapshot_len = len(full_ids) - len(suffix_ids)
 
-        if (
-            cache_snapshot_len is None
-            and cache_prefix_prompt
-            and prompt_cache_state is not None
-        ):
-            prefix_inputs = self._detach_mx_arrays(
-                self._cpu_preprocess(cache_prefix_prompt, images, audio)
-            )
-            prefix_ids = prefix_inputs.get("input_ids")
-            cache_snapshot_len = (
-                prefix_ids.size if hasattr(prefix_ids, "size") else len(prefix_ids)
-            )
+            if (
+                cache_snapshot_len is None
+                and cache_prefix_prompt
+                and prompt_cache_state is not None
+            ):
+                prefix_inputs = self._detach_mx_arrays(
+                    self._cpu_preprocess(cache_prefix_prompt, images, audio)
+                )
+                prefix_ids = prefix_inputs.get("input_ids")
+                cache_snapshot_len = (
+                    prefix_ids.size if hasattr(prefix_ids, "size") else len(prefix_ids)
+                )
         prompt_tokens = (
             raw_inputs["input_ids"].size
             if hasattr(raw_inputs["input_ids"], "size")
@@ -955,7 +961,8 @@ class ResponseGenerator:
                 for j, uid in enumerate(uids):
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
-                    text = self.tokenizer.decode([tok])
+                    with tokenizer_lock:
+                        text = self.tokenizer.decode([tok])
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
@@ -1002,12 +1009,13 @@ class ResponseGenerator:
                         token_lists[uid].append(tok)
                         tokens = token_lists[uid]
 
-                        if len(tokens) >= 2:
-                            prev = self.tokenizer.decode(tokens[:-1])
-                            curr = self.tokenizer.decode(tokens)
-                            text = curr[len(prev) :]
-                        else:
-                            text = self.tokenizer.decode(tokens)
+                        with tokenizer_lock:
+                            if len(tokens) >= 2:
+                                prev = self.tokenizer.decode(tokens[:-1])
+                                curr = self.tokenizer.decode(tokens)
+                                text = curr[len(prev) :]
+                            else:
+                                text = self.tokenizer.decode(tokens)
 
                         is_stop = tok in self.stop_tokens
                         is_max = len(tokens) >= max_tokens_map[uid]
@@ -1078,7 +1086,8 @@ class ResponseGenerator:
                 text = ""
             else:
                 info["tokens"].append(tok)
-                curr = self.tokenizer.decode(info["tokens"])
+                with tokenizer_lock:
+                    curr = self.tokenizer.decode(info["tokens"])
                 text = curr[len(info["prev_text"]) :]
                 info["prev_text"] = curr
 
@@ -1304,7 +1313,8 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
     """Decode a single token id to its string + UTF-8 bytes."""
     try:
-        text = tokenizer.decode([int(token_id)])
+        with tokenizer_lock:
+            text = tokenizer.decode([int(token_id)])
     except Exception:
         text = ""
     try:
@@ -2164,13 +2174,14 @@ async def responses_endpoint(request: Request):
 
         gen_args = _build_gen_args(openai_request)
 
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(images),
-            **gen_args.to_template_kwargs(),
-        )
+        with tokenizer_lock:
+            formatted_prompt = apply_chat_template(
+                processor,
+                config,
+                chat_messages,
+                num_images=len(images),
+                **gen_args.to_template_kwargs(),
+            )
         prompt_cache_state = get_prompt_cache_state(
             openai_request.model,
             model_cache.get("adapter_path"),
@@ -2567,25 +2578,26 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         gen_args = _build_gen_args(request)
 
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            processed_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-            tools=tools,
-            **gen_args.to_template_kwargs(),
-        )
-        cache_prefix_prompt = apply_chat_template(
-            processor,
-            config,
-            processed_messages,
-            add_generation_prompt=False,
-            num_images=len(images),
-            num_audios=len(audio),
-            tools=tools,
-            **gen_args.to_template_kwargs(),
-        )
+        with tokenizer_lock:
+            formatted_prompt = apply_chat_template(
+                processor,
+                config,
+                processed_messages,
+                num_images=len(images),
+                num_audios=len(audio),
+                tools=tools,
+                **gen_args.to_template_kwargs(),
+            )
+            cache_prefix_prompt = apply_chat_template(
+                processor,
+                config,
+                processed_messages,
+                add_generation_prompt=False,
+                num_images=len(images),
+                num_audios=len(audio),
+                tools=tools,
+                **gen_args.to_template_kwargs(),
+            )
         prompt_cache_state = get_prompt_cache_state(
             request.model,
             model_cache.get("adapter_path"),
