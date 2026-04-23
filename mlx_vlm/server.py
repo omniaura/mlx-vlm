@@ -284,6 +284,7 @@ class ResponseGenerator:
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
         prompt_cache_state: Optional[PromptCacheState] = None,
+        cache_prefix_prompt: Optional[str] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
         args = args or GenerationArguments()
         rqueue: Queue = Queue()
@@ -291,6 +292,15 @@ class ResponseGenerator:
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._detach_mx_arrays(self._cpu_preprocess(prompt, images, audio))
+        cache_snapshot_len = None
+        if cache_prefix_prompt and prompt_cache_state is not None:
+            prefix_inputs = self._detach_mx_arrays(
+                self._cpu_preprocess(cache_prefix_prompt, images, audio)
+            )
+            prefix_ids = prefix_inputs.get("input_ids")
+            cache_snapshot_len = (
+                prefix_ids.size if hasattr(prefix_ids, "size") else len(prefix_ids)
+            )
         prompt_tokens = (
             raw_inputs["input_ids"].size
             if hasattr(raw_inputs["input_ids"], "size")
@@ -298,7 +308,15 @@ class ResponseGenerator:
         )
 
         self.requests.put(
-            (rqueue, raw_inputs, prompt_tokens, args, images, prompt_cache_state)
+            (
+                rqueue,
+                raw_inputs,
+                prompt_tokens,
+                args,
+                images,
+                prompt_cache_state,
+                cache_snapshot_len,
+            )
         )
 
         # Block until the GPU thread sends back the context
@@ -574,6 +592,7 @@ class ResponseGenerator:
                     args,
                     images,
                     prompt_cache_state,
+                    cache_snapshot_len,
                 ) in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
@@ -599,6 +618,9 @@ class ResponseGenerator:
                     ) = self._prepare_prompt_cache_reuse(
                         input_ids, gen_kwargs, prompt_cache_state
                     )
+                    effective_cache_snapshot_len = (
+                        None if cached_prompt_tokens else cache_snapshot_len
+                    )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
                     # Image/embed requests can't share a prefill batch with
@@ -612,6 +634,7 @@ class ResponseGenerator:
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
                             prompt_caches=[reusable_prompt_cache],
+                            cache_snapshot_lengths=[effective_cache_snapshot_len],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -629,6 +652,7 @@ class ResponseGenerator:
                         "tokens": [],
                         "prev_text": "",
                         "input_ids": input_ids.squeeze(0).tolist(),
+                        "cache_snapshot_len": effective_cache_snapshot_len,
                         "prompt_cache_state": prompt_cache_state,
                         "cached_prompt_tokens": cached_prompt_tokens,
                         "gen_kwargs": gen_kwargs if has_embeds else None,
@@ -869,14 +893,18 @@ class ResponseGenerator:
             if prompt_cache_state is not None and getattr(
                 r, "prefill_prompt_cache", None
             ):
+                prefill_token_ids = info.get("input_ids", [])
+                cache_snapshot_len = info.get("cache_snapshot_len")
+                if cache_snapshot_len is not None:
+                    prefill_token_ids = prefill_token_ids[:cache_snapshot_len]
                 prompt_cache_state.update(
-                    info.get("input_ids", []),
+                    prefill_token_ids,
                     r.prefill_prompt_cache,
                 )
                 if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
                     print(
                         "CACHE_DEBUG",
-                        f"stored=prefill len={len(info.get('input_ids', []))}",
+                        f"stored=prefill len={len(prefill_token_ids)}",
                         flush=True,
                     )
 
@@ -2313,6 +2341,16 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools=tools,
             **gen_args.to_template_kwargs(),
         )
+        cache_prefix_prompt = apply_chat_template(
+            processor,
+            config,
+            processed_messages,
+            add_generation_prompt=False,
+            num_images=len(images),
+            num_audios=len(audio),
+            tools=tools,
+            **gen_args.to_template_kwargs(),
+        )
         prompt_cache_state = get_prompt_cache_state(
             request.model,
             model_cache.get("adapter_path"),
@@ -2348,6 +2386,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             audio if audio else None,
                             gen_args,
                             prompt_cache_state,
+                            cache_prefix_prompt,
                         )
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -2594,6 +2633,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             audio=audio if audio else None,
                             args=gen_args,
                             prompt_cache_state=prompt_cache_state,
+                            cache_prefix_prompt=cache_prefix_prompt,
                         )
                         pt = ctx.prompt_tokens
                         cached = ctx.cached_prompt_tokens

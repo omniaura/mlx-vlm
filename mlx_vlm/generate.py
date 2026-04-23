@@ -1859,6 +1859,7 @@ class PromptProcessingBatch:
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         prompt_cache: Optional[List[Any]] = None,
+        cache_snapshot_lengths: Optional[List[Optional[int]]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1873,6 +1874,9 @@ class PromptProcessingBatch:
         self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
+        self._processed_tokens = 0
+        self._cache_snapshot_lengths = cache_snapshot_lengths or [None] * len(uids)
+        self._cache_snapshots = [None] * len(uids)
 
         self.prompt_cache = prompt_cache or _make_cache(
             model,
@@ -1889,6 +1893,15 @@ class PromptProcessingBatch:
         """True if prompt needs chunked processing before generate()."""
         if self._inputs_embeds is None or self.prefill_step_size is None:
             return False
+        for target, snapshot in zip(
+            self._cache_snapshot_lengths, self._cache_snapshots
+        ):
+            if (
+                target is not None
+                and snapshot is None
+                and self._processed_tokens < target < self._inputs_embeds.shape[1]
+            ):
+                return True
         return self._inputs_embeds.shape[1] > self.prefill_step_size
 
     def prompt_step(self) -> int:
@@ -1897,6 +1910,16 @@ class PromptProcessingBatch:
             return 0
 
         n = min(self.prefill_step_size, self._inputs_embeds.shape[1] - 1)
+        for target, snapshot in zip(
+            self._cache_snapshot_lengths, self._cache_snapshots
+        ):
+            if (
+                target is not None
+                and snapshot is None
+                and self._processed_tokens < target < self._processed_tokens + n
+            ):
+                n = target - self._processed_tokens
+                break
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
@@ -1905,6 +1928,14 @@ class PromptProcessingBatch:
             **self._prompt_kwargs,
         )
         mx.eval([c.state for c in self.prompt_cache])
+        self._processed_tokens += n
+        for i, target in enumerate(self._cache_snapshot_lengths):
+            if (
+                target is not None
+                and self._cache_snapshots[i] is None
+                and self._processed_tokens == target
+            ):
+                self._cache_snapshots[i] = snapshot_prompt_cache(self.prompt_cache, i)
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         mx.clear_cache()
@@ -1935,7 +1966,9 @@ class PromptProcessingBatch:
             max_tokens=list(self.max_tokens),
             top_logprobs_k=top_logprobs_k,
             prefill_prompt_caches=[
-                snapshot_prompt_cache(self.prompt_cache, i)
+                self._cache_snapshots[i]
+                if self._cache_snapshots[i] is not None
+                else snapshot_prompt_cache(self.prompt_cache, i)
                 for i in range(len(self.uids))
             ],
         )
@@ -2053,6 +2086,7 @@ class BatchGenerator:
         max_tokens: Union[List[int], int, None] = None,
         prompt_kwargs: Optional[List[dict]] = None,
         prompt_caches: Optional[List[Optional[list]]] = None,
+        cache_snapshot_lengths: Optional[List[Optional[int]]] = None,
     ):
         uids = []
 
@@ -2063,9 +2097,13 @@ class BatchGenerator:
             prompt_kwargs = [{}] * len(prompts)
         if prompt_caches is None:
             prompt_caches = [None] * len(prompts)
+        if cache_snapshot_lengths is None:
+            cache_snapshot_lengths = [None] * len(prompts)
 
-        for p, m, kw, pc in zip(prompts, max_tokens, prompt_kwargs, prompt_caches):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw, pc))
+        for p, m, kw, pc, csl in zip(
+            prompts, max_tokens, prompt_kwargs, prompt_caches, cache_snapshot_lengths
+        ):
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, pc, csl))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2077,7 +2115,7 @@ class BatchGenerator:
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
         # Waiting in the queue.
-        for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
+        for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
             if seq_uid == uid:
                 self._unprocessed_sequences.pop(i)
                 return True
@@ -2172,13 +2210,16 @@ class BatchGenerator:
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
         if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
-            first_has_cache = self._unprocessed_sequences[0][4] is not None
-            if first_has_cache:
+            first_has_cache_or_snapshot = (
+                self._unprocessed_sequences[0][4] is not None
+                or self._unprocessed_sequences[0][5] is not None
+            )
+            if first_has_cache_or_snapshot:
                 n = 1
             else:
                 uncached_count = 0
                 for sequence in self._unprocessed_sequences:
-                    if sequence[4] is not None:
+                    if sequence[4] is not None or sequence[5] is not None:
                         break
                     uncached_count += 1
                 n = min(self.prefill_batch_size, uncached_count)
@@ -2190,6 +2231,7 @@ class BatchGenerator:
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
             prompt_caches = [s[4] for s in sequences]
+            cache_snapshot_lengths = [s[5] for s in sequences]
 
             inputs_embeds = None
             merged_kwargs = {}
@@ -2221,6 +2263,7 @@ class BatchGenerator:
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
                 prompt_cache=prompt_caches[0] if len(prompt_caches) == 1 else None,
+                cache_snapshot_lengths=cache_snapshot_lengths,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
