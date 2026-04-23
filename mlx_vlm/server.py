@@ -1310,6 +1310,50 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
     return None, text
 
 
+def _split_thinking_stream_piece(
+    text: str, in_thinking: bool
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Split one generated text piece into reasoning/content deltas."""
+    reasoning_parts = []
+    content_parts = []
+    remaining = text
+
+    while remaining:
+        if in_thinking:
+            end_tags = ["</think>", "<channel|>"]
+            positions = [
+                (remaining.find(tag), tag)
+                for tag in end_tags
+                if remaining.find(tag) >= 0
+            ]
+            if not positions:
+                reasoning_parts.append(remaining)
+                break
+            pos, tag = min(positions, key=lambda item: item[0])
+            reasoning_parts.append(remaining[:pos])
+            remaining = remaining[pos + len(tag) :]
+            in_thinking = False
+            continue
+
+        start_tags = ["<think>", "<|channel>thought"]
+        positions = [
+            (remaining.find(tag), tag)
+            for tag in start_tags
+            if remaining.find(tag) >= 0
+        ]
+        if not positions:
+            content_parts.append(remaining)
+            break
+        pos, tag = min(positions, key=lambda item: item[0])
+        content_parts.append(remaining[:pos])
+        remaining = remaining[pos + len(tag) :]
+        in_thinking = True
+
+    reasoning = "".join(reasoning_parts) or None
+    content = "".join(content_parts) or None
+    return in_thinking, reasoning, content
+
+
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
     """Decode a single token id to its string + UTF-8 bytes."""
     try:
@@ -1697,6 +1741,12 @@ class ChatMessage(FlexibleBaseModel):
     reasoning: Optional[str] = Field(
         None, description="Thinking/reasoning content (when thinking is enabled)."
     )
+    reasoning_content: Optional[str] = Field(
+        None,
+        description=(
+            "OpenAI-compatible reasoning content consumed by Vercel AI SDK."
+        ),
+    )
     tool_calls: Optional[List[Any]] = Field(
         None, description="Tool calls made by the assistant."
     )
@@ -1956,13 +2006,22 @@ class PromptTokensDetails(BaseModel):
     cached_tokens: int = 0
 
 
+class CompletionTokensDetails(BaseModel):
+    reasoning_tokens: int = 0
+
+
 class UsageStats(BaseModel):
     """OpenAI-compatible usage statistics for chat completions."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
+    completion_tokens_details: CompletionTokensDetails = Field(
+        default_factory=CompletionTokensDetails
+    )
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
@@ -2433,6 +2492,7 @@ async def responses_endpoint(request: Request):
                                 }
                             ],
                             "reasoning": reasoning,
+                            "reasoning_content": reasoning,
                         }
                     ],
                     output_text=content,
@@ -2622,6 +2682,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
                 output_tokens = 0
+                reasoning_tokens = 0
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None:
@@ -2641,8 +2702,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         # Track thinking state for reasoning/content split
-                        in_thinking = False
-                        accumulated = ""
+                        in_thinking = gen_args.enable_thinking
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -2660,34 +2720,18 @@ async def chat_completions_endpoint(request: ChatRequest):
                             if token is None:
                                 break
                             output_tokens += 1
-                            accumulated += token.text
                             full_output += token.text
 
-                            # Detect thinking boundaries
-                            delta_reasoning = None
-                            delta_content = None
-
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
-                            ):
-                                in_thinking = True
-                                accumulated = ""
-                                # Don't emit opening tag tokens
-                            elif in_thinking and (
-                                "<channel|>" in accumulated or "</think>" in accumulated
-                            ):
-                                in_thinking = False
-                                accumulated = ""
-                                # Don't emit closing tag tokens
-                            elif in_thinking:
-                                delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
-                            ):
-                                pass  # Partial tag, don't emit yet
-                            else:
-                                delta_content = token.text
+                            (
+                                in_thinking,
+                                delta_reasoning,
+                                delta_content,
+                            ) = _split_thinking_stream_piece(
+                                token.text,
+                                in_thinking,
+                            )
+                            if delta_reasoning is not None:
+                                reasoning_tokens += 1
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -2724,6 +2768,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                             role="assistant",
                                             content=delta_content,
                                             reasoning=delta_reasoning,
+                                            reasoning_content=delta_reasoning,
                                         ),
                                         logprobs=chunk_logprobs,
                                     )
@@ -2739,6 +2784,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                                         + output_tokens,
                                         "prompt_tokens_details": {
                                             "cached_tokens": ctx.cached_prompt_tokens,
+                                        },
+                                        "completion_tokens_details": {
+                                            "reasoning_tokens": reasoning_tokens,
                                         },
                                     },
                                     choices=choices,
@@ -2941,6 +2989,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                 gc.collect()
 
                 reasoning, content = _split_thinking(full_text)
+                reasoning_token_count = 0
+                if reasoning:
+                    tokenizer = (
+                        processor.tokenizer
+                        if hasattr(processor, "tokenizer")
+                        else processor
+                    )
+                    with tokenizer_lock:
+                        reasoning_token_count = len(
+                            tokenizer.encode(reasoning, add_special_tokens=False)
+                        )
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
@@ -2957,6 +3016,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                             if response_generator is None
                             else cached_prompt_tokens
                         ),
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     peak_memory=peak_memory,
                 )
@@ -3008,6 +3070,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             role="assistant",
                             content=content if content else None,
                             reasoning=reasoning,
+                            reasoning_content=reasoning,
                             tool_calls=parsed_tool_calls,
                         ),
                         logprobs=response_logprobs,
