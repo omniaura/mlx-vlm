@@ -435,7 +435,17 @@ class ResponseGenerator:
         if prompt_cache_state is None or prompt_cache_state.cache is None:
             return full_ids, gen_kwargs, None, 0
 
-        prefix_len = prompt_cache_state.find_prefix_length(full_ids)
+        if hasattr(prompt_cache_state, "best_prefix_match"):
+            (
+                prefix_len,
+                matched_token_ids,
+                matched_cache,
+            ) = prompt_cache_state.best_prefix_match(full_ids)
+        else:
+            prefix_len = prompt_cache_state.find_prefix_length(full_ids)
+            matched_token_ids = prompt_cache_state.token_ids
+            matched_cache = prompt_cache_state.cache
+
         reusable_prefix_len = min(prefix_len, max(len(full_ids) - 1, 0))
         if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
             print(
@@ -443,6 +453,7 @@ class ResponseGenerator:
                 f"prefix_len={prefix_len}",
                 f"full_len={len(full_ids)}",
                 f"reusable_prefix_len={reusable_prefix_len}",
+                f"matched_len={len(matched_token_ids or [])}",
                 flush=True,
             )
         if reusable_prefix_len <= 0:
@@ -459,12 +470,12 @@ class ResponseGenerator:
             if isinstance(value, mx.array) and value.ndim >= 2:
                 trimmed_kwargs[key] = value[:, reusable_prefix_len:]
 
-        if reusable_prefix_len == len(prompt_cache_state.token_ids or []):
-            reusable_prompt_cache = copy.deepcopy(prompt_cache_state.cache)
+        if reusable_prefix_len == len(matched_token_ids or []):
+            reusable_prompt_cache = copy.deepcopy(matched_cache)
         else:
             try:
                 reusable_prompt_cache = trim_prompt_cache(
-                    prompt_cache_state.cache, reusable_prefix_len
+                    matched_cache, reusable_prefix_len
                 )
             except TypeError as exc:
                 if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
@@ -862,6 +873,25 @@ class ResponseGenerator:
                     info.get("input_ids", []),
                     r.prefill_prompt_cache,
                 )
+                if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+                    print(
+                        "CACHE_DEBUG",
+                        f"stored=prefill len={len(info.get('input_ids', []))}",
+                        flush=True,
+                    )
+
+            if prompt_cache_state is not None and getattr(r, "prompt_cache", None):
+                completed_ids = list(info.get("input_ids", []))
+                completed_ids.extend(info.get("tokens", []))
+                if r.finish_reason == "stop":
+                    completed_ids.append(tok)
+                prompt_cache_state.update(completed_ids, r.prompt_cache)
+                if os.environ.get("MLX_VLM_CACHE_DEBUG") == "1":
+                    print(
+                        "CACHE_DEBUG",
+                        f"stored=completed len={len(completed_ids)}",
+                        flush=True,
+                    )
 
             rqueue.put(
                 StreamingToken(

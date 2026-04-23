@@ -394,6 +394,7 @@ class PromptCacheState:
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
         self.last_reused_prefix_len: int = 0
+        self.snapshots: List[Tuple[List[int], List[Any]]] = []
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -405,10 +406,37 @@ class PromptCacheState:
                 return i
         return max_len
 
+    def best_prefix_match(
+        self, new_ids: list
+    ) -> Tuple[int, Optional[List[int]], Optional[List[Any]]]:
+        """Return the cached snapshot with the longest shared token prefix."""
+        best_prefix_len = 0
+        best_token_ids = None
+        best_cache = None
+        candidates = list(self.snapshots)
+        if self.token_ids is not None and self.cache is not None:
+            candidates.append((self.token_ids, self.cache))
+
+        for token_ids, cache in candidates:
+            max_len = min(len(token_ids), len(new_ids))
+            prefix_len = 0
+            for i in range(max_len):
+                if token_ids[i] != new_ids[i]:
+                    break
+                prefix_len += 1
+            if prefix_len > best_prefix_len:
+                best_prefix_len = prefix_len
+                best_token_ids = token_ids
+                best_cache = cache
+
+        return best_prefix_len, best_token_ids, best_cache
+
     def update(self, token_ids: list, kv_cache: list):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+        self.snapshots.append((self.token_ids, self.cache))
+        self.snapshots = self.snapshots[-4:]
 
 
 def _slice_cache_tokens(value, length: int):
