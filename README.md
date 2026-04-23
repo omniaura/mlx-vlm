@@ -3,8 +3,12 @@
 
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
+> [!NOTE]
+> This `omniaura/mlx-vlm` fork tracks upstream MLX-VLM and carries a macOS/OpenCode server path tuned for local Apple Silicon inference. It adds OpenAI-compatible chat serving improvements for OpenCode, including continuous batching, prompt cache snapshots for growing-prefix conversations, TurboQuant KV cache support, runtime observability, and streamed reasoning deltas.
+
 ## Table of Contents
 - [Installation](#installation)
+- [OpenCode on macOS](#opencode-on-macos)
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
@@ -51,6 +55,37 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 
 ```sh
 pip install -U mlx-vlm
+```
+
+## OpenCode on macOS
+
+When the server is running on your Mac mini, point OpenCode at the OpenAI-compatible endpoint. Replace the host with your Mac's LAN IP, or use `127.0.0.1` if OpenCode runs on the same machine.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "qwen36/unsloth/Qwen3.6-27B-UD-MLX-6bit",
+  "small_model": "qwen36/unsloth/Qwen3.6-27B-UD-MLX-6bit",
+  "provider": {
+    "qwen36": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen 3.6 MLX-VLM",
+      "options": {
+        "baseURL": "http://10.0.0.224:8000/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "unsloth/Qwen3.6-27B-UD-MLX-6bit": {
+          "name": "Qwen 3.6 27B MLX 6-bit",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
 ## Usage
