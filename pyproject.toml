@@ -45,6 +45,6 @@ version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
-ui = ["gradio>=5.19.0"]
+ui = ["gradio>=5.19.0", "brotli>=1.2.1"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
