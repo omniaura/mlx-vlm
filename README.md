@@ -163,9 +163,10 @@ See [docs/usage.md](docs/usage.md) for Python API examples including batch gener
 
 ### Chat UI with Gradio
 
-Launch a chat interface using Gradio:
+Install the UI dependencies, then launch the chat interface:
 
 ```sh
+pip install -U 'mlx-vlm[ui]'
 mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 ```
 

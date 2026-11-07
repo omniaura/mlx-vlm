@@ -10,9 +10,10 @@ python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max
 
 ## Chat UI with Gradio
 
-Launch the chat interface:
+Install the UI dependencies, then launch the chat interface:
 
 ```bash
+pip install -U 'mlx-vlm[ui]'
 python -m mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 ```
 
